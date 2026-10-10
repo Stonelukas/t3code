@@ -19,6 +19,7 @@ import { SERVICE_LAUNCHER_PROTOCOL } from "./serviceProtocol.ts";
 import * as ServerSelfUpdate from "./selfUpdate.ts";
 
 interface HarnessOptions {
+  readonly currentVersion?: string;
   readonly mode?: "web" | "desktop";
   readonly managed?: boolean;
   readonly preflight?: "ready" | "blocked";
@@ -109,7 +110,7 @@ const makeHarness = Effect.fn("test.make_self_update_harness")(function* (
   const config = yield* ServerConfig.ServerConfig.pipe(
     Effect.provide(ServerConfig.layerTest(process.cwd(), baseDir)),
   );
-  const selfUpdate = yield* ServerSelfUpdate.make().pipe(
+  const selfUpdate = yield* ServerSelfUpdate.make(options.currentVersion ?? "1.0.0").pipe(
     Effect.provideService(ProcessRunner.ProcessRunner, runner),
     Effect.provideService(ServiceLauncherClient.ServiceLauncherClient, launcher),
     Effect.provideService(
@@ -128,6 +129,25 @@ const makeHarness = Effect.fn("test.make_self_update_harness")(function* (
 });
 
 it.layer(NodeServices.layer)("server self update", (it) => {
+  it.effect.each(["web", "desktop"] as const)(
+    "refuses owner-managed fork replacement before side effects in %s",
+    (mode) =>
+      Effect.gen(function* () {
+        const { selfUpdate, order } = yield* makeHarness({
+          mode,
+          currentVersion: "0.0.46-nightly.20261009.2886.stonelukas.1",
+        });
+        const error = yield* selfUpdate
+          .update({ targetVersion: "0.0.46-nightly.20261010.3000" })
+          .pipe(Effect.flip);
+        expect(error.reason).toContain("owner-managed");
+        expect(order).toEqual([]);
+        const commitError = yield* selfUpdate.commitDesktopUpdate("old-token").pipe(Effect.flip);
+        expect(commitError.reason).toContain("owner-managed");
+        expect(order).toEqual([]);
+      }),
+  );
+
   it.effect("marks running threads at the boot-service handoff", () =>
     Effect.gen(function* () {
       const events: string[] = [];

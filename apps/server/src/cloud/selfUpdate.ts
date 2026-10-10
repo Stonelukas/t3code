@@ -20,7 +20,12 @@ import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import { HttpClient } from "effect/http";
 
-import { CLI_RELEASE_BASE_URL_ENV } from "@t3tools/shared/cliRelease";
+import {
+  CLI_RELEASE_BASE_URL_ENV,
+  isOwnerManagedForkVersion,
+  OWNER_MANAGED_FORK_UPDATE_REASON,
+} from "@t3tools/shared/cliRelease";
+import packageJson from "../../package.json" with { type: "json" };
 
 import * as ServerConfig from "../config.ts";
 import * as DesktopAppUpdate from "../desktopUpdate/DesktopAppUpdate.ts";
@@ -169,7 +174,9 @@ export const withRunningThreadContinuation = Effect.fn(
   });
 });
 
-export const make = Effect.fn("cloud.server_self_update.make")(function* () {
+export const make = Effect.fn("cloud.server_self_update.make")(function* (
+  currentVersion = packageJson.version,
+) {
   const serverConfig = yield* ServerConfig.ServerConfig;
   const desktopAppUpdate = yield* DesktopAppUpdate.DesktopAppUpdate;
   const launcher = yield* ServiceLauncherClient.ServiceLauncherClient;
@@ -196,6 +203,9 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
   const update: ServerSelfUpdate["Service"]["update"] = Effect.fn(
     "cloud.server_self_update.update",
   )(function* (input, reportProgress = () => Effect.void, onHandoffAccepted = () => Effect.void) {
+    if (isOwnerManagedForkVersion(currentVersion)) {
+      return yield* failWith(OWNER_MANAGED_FORK_UPDATE_REASON);
+    }
     if (capability === "desktop-managed") {
       // input.targetVersion is meaningless here: the desktop app's own
       // update feed decides what it downloads, and the result carries what
@@ -337,7 +347,9 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
   return ServerSelfUpdate.of({
     update,
     commitDesktopUpdate: (requestId, onHandoffAccepted) =>
-      desktopAppUpdate.commit(requestId, onHandoffAccepted),
+      isOwnerManagedForkVersion(currentVersion)
+        ? Effect.fail(failWith(OWNER_MANAGED_FORK_UPDATE_REASON))
+        : desktopAppUpdate.commit(requestId, onHandoffAccepted),
   });
 });
 

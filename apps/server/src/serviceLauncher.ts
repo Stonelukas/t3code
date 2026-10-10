@@ -9,6 +9,10 @@ import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
+import {
+  isOwnerManagedForkVersion,
+  OWNER_MANAGED_FORK_UPDATE_REASON,
+} from "@t3tools/shared/cliRelease";
 
 import type {
   PendingServiceUpdate,
@@ -499,6 +503,13 @@ export class Launcher {
     }
     if (compareExactServiceVersions(message.targetVersion, child.version) <= 0) {
       await reject("Remote updates must select a newer server version.");
+      return;
+    }
+    if (
+      isOwnerManagedForkVersion(child.version) &&
+      !isOwnerManagedForkVersion(message.targetVersion)
+    ) {
+      await reject(OWNER_MANAGED_FORK_UPDATE_REASON);
       return;
     }
     if (!NodePath.isAbsolute(message.dbPath)) {

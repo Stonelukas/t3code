@@ -9,9 +9,24 @@ import {
   cliReleaseIndexPageUrl,
   newestCliReleaseVersion,
   parseChecksums,
+  isOwnerManagedForkVersion,
 } from "./cliRelease.ts";
 
 describe("cliRelease", () => {
+  it("identifies only the owner-managed nightly fork lineage", () => {
+    expect(isOwnerManagedForkVersion("0.0.46-nightly.20261009.2886.stonelukas.1")).toBe(true);
+    expect(isOwnerManagedForkVersion("0.0.46-nightly.20261010.3000.stonelukas.2")).toBe(true);
+    for (const version of [
+      "0.0.46-nightly.20261009.2886",
+      "0.0.46-nightly.20261009.2886+stonelukas.1",
+      "0.0.46-nightly.20261009.2886.stonelukas.01",
+      "0.0.46-nightly.20261009.2886.stonelukas.0",
+      "0.0.46",
+    ]) {
+      expect(isOwnerManagedForkVersion(version)).toBe(false);
+    }
+  });
+
   it("names archives by version and platform, zip only on Windows", () => {
     expect(cliArchiveFileName("1.2.3-preview.20260911.4", "linux-x64")).toBe(
       "t3-1.2.3-preview.20260911.4-linux-x64.tar.gz",

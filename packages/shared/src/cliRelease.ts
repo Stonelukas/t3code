@@ -10,6 +10,14 @@ export const CLI_RELEASE_CHECKSUMS_FILE = "SHA256SUMS";
 /** Overrides the download origin for mirrors and air-gapped installs. */
 export const CLI_RELEASE_BASE_URL_ENV = "T3CODE_RELEASE_BASE_URL";
 
+/** This local fork is released as reviewed artifacts, not by the upstream updater. */
+export function isOwnerManagedForkVersion(version: string): boolean {
+  return /^\d+\.\d+\.\d+-nightly\.\d{8}\.\d+\.stonelukas\.[1-9]\d*$/.test(version);
+}
+
+export const OWNER_MANAGED_FORK_UPDATE_REASON =
+  "This Stonelukas fork is owner-managed. Normal upstream updates are disabled to preserve local changes. Prepare and review a new fork artifact before installing it; returning to upstream requires a separate explicit installation decision.";
+
 /**
  * The archives a release attaches. Kept in step with the build_linux_cli
  * matrix, build_windows_arm64_cli, and the `cli_archive` rows in
