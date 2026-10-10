@@ -255,6 +255,28 @@ export const writesEnvironment = <P, A, E, R>(
   return declare((params: P) => check.pipe(Effect.flatMap(() => handle(params, check))));
 };
 
+/** Only maintenance's exact credential-bound reservation may act after its foreground run drains. */
+export const writesProviderMaintenance = <P extends { readonly phase: string }, A, E, R>(
+  handle: (
+    params: P,
+    check: Effect.Effect<Caller, OrchestratorMcpFailure, CheckServices>,
+  ) => Effect.Effect<A, E, R>,
+) =>
+  declare((params: P) => {
+    const check = requireThreadCaller.pipe(
+      Effect.andThen(refuseReadOnlyClient),
+      Effect.andThen(readCaller()),
+      Effect.tap((caller) => (params.phase === "reserve" ? assertLiveCaller(caller) : Effect.void)),
+      Effect.tap((caller) =>
+        assertFullAccess(
+          caller,
+          "Provider maintenance requires a full-access/default calling thread.",
+        ),
+      ),
+    );
+    return check.pipe(Effect.flatMap(() => handle(params, check)));
+  });
+
 /** What a declaration's own check needs. */
 type CheckServices = Effect.Services<typeof orchestratingCaller>;
 

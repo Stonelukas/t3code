@@ -361,6 +361,30 @@ export const OrchestrationV2LimitRecoveryUpdate = Schema.Struct({
 );
 export type OrchestrationV2LimitRecoveryUpdate = typeof OrchestrationV2LimitRecoveryUpdate.Type;
 
+/** One durable owner for explicit provider maintenance; never a run or queued prompt. */
+export const OrchestrationV2ProviderMaintenance = Schema.Struct({
+  requestId: CommandId,
+  kind: Schema.Literals(["pi-rpc-restart", "suite-reload"]),
+  scope: Schema.Literals(["thread", "environment"]),
+  providerSessionId: ProviderSessionId,
+  providerThreadId: ProviderThreadId,
+  deadlineEpochMs: Schema.Number,
+  callerNamespace: Schema.optional(Schema.String),
+  callerIssuedAt: Schema.optional(Schema.Number),
+  requestingRunId: Schema.optional(Schema.NullOr(RunId)),
+  status: Schema.Literals([
+    "pending",
+    "running",
+    "succeeded",
+    "failed",
+    "unknown",
+    "expired",
+    "cancelled",
+  ]),
+  message: Schema.NullOr(Schema.String),
+});
+export type OrchestrationV2ProviderMaintenance = typeof OrchestrationV2ProviderMaintenance.Type;
+
 export const OrchestrationV2AppThread = Schema.Struct({
   ...OrchestrationV2CreationFields,
   id: ThreadId,
@@ -379,6 +403,7 @@ export const OrchestrationV2AppThread = Schema.Struct({
   /** Pull request discovered from the thread's current branch. */
   branchPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
   activeProviderThreadId: Schema.NullOr(ProviderThreadId),
+  providerMaintenance: Schema.optional(OrchestrationV2ProviderMaintenance),
   historyOrigin: Schema.optional(OrchestrationV2ThreadHistoryOrigin),
   lineage: OrchestrationV2AppThreadLineage,
   forkedFrom: Schema.NullOr(
@@ -1852,6 +1877,7 @@ export const OrchestrationV2ThreadShell = Schema.Struct({
   lineage: OrchestrationV2AppThreadLineage,
   forkedFrom: Schema.NullOr(OrchestrationV2AppThread.fields.forkedFrom),
   activeProviderThreadId: Schema.NullOr(ProviderThreadId),
+  providerMaintenance: Schema.optional(OrchestrationV2ProviderMaintenance),
   historyOrigin: Schema.optional(OrchestrationV2ThreadHistoryOrigin),
   latestRunId: Schema.NullOr(RunId),
   latestRunRequestedAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
@@ -2608,6 +2634,13 @@ export const OrchestrationV2StoredEventJson = Schema.Struct({
 });
 export type OrchestrationV2StoredEventJson = typeof OrchestrationV2StoredEventJson.Type;
 
+export const OrchestrationV2RestartPiRpcCommand = Schema.Struct({
+  type: Schema.Literal("provider-session.restart"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  providerSessionId: ProviderSessionId,
+});
+
 export const OrchestrationV2Command = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("thread.create"),
@@ -2834,6 +2867,7 @@ export const OrchestrationV2Command = Schema.Union([
     providerSessionId: ProviderSessionId,
     reason: Schema.optional(Schema.String),
   }),
+  OrchestrationV2RestartPiRpcCommand,
   Schema.Struct({
     type: Schema.Literal("message.dispatch"),
     notification: Schema.optional(OrchestrationV2Notification),
@@ -3137,6 +3171,7 @@ export type OrchestrationV2ServerCommand = OrchestrationV2Command | Orchestratio
 
 export const ORCHESTRATION_V2_WS_METHODS = {
   dispatchCommand: "orchestration.dispatchCommand",
+  restartPiRpc: "orchestration.restartPiRpc",
   getTurnDiff: "orchestration.getTurnDiff",
   getFullThreadDiff: "orchestration.getFullThreadDiff",
   searchThreads: "orchestration.searchThreads",
@@ -3398,6 +3433,8 @@ export class OrchestrationV2DispatchCommandError extends Schema.TaggedError<Orch
     commandId: CommandId,
     commandType: Schema.String,
     message: Schema.String,
+    /** Explicit restart only: true after the server verified no accepted receipt for this attempt. */
+    notAccepted: Schema.optional(Schema.Boolean),
     detail: Schema.optional(Schema.String),
     cause: Schema.optional(Schema.Defect()),
   },
@@ -3565,6 +3602,10 @@ export const OrchestrationV2RpcSchemas = {
   },
   dispatchCommand: {
     input: OrchestrationV2Command,
+    output: OrchestrationV2DispatchCommandResult,
+  },
+  restartPiRpc: {
+    input: OrchestrationV2RestartPiRpcCommand,
     output: OrchestrationV2DispatchCommandResult,
   },
   getTurnDiff: {

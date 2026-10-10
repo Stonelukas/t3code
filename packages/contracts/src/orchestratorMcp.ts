@@ -30,6 +30,7 @@ import {
   OrchestrationV2CreationSource,
   OrchestrationV2RunStatus,
   OrchestrationV2TurnItemStatus,
+  OrchestrationV2ProviderMaintenance,
 } from "./orchestrationV2.ts";
 import {
   ProviderOptionDescriptor,
@@ -41,6 +42,21 @@ import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
 const OrchestratorMcpPrompt = TrimmedNonEmptyString.check(Schema.isMaxLength(120_000)).annotate({
   description: "Complete task or message text for the target agent.",
 });
+
+/** A caller-owned finite reservation; begin grants one attempt, never a queued reload. */
+export const OrchestratorMcpProviderMaintenanceInput = Schema.Struct({
+  clientRequestId: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+  phase: Schema.Literals(["reserve", "begin", "finish", "cancel", "status"]),
+  outcome: Schema.optional(Schema.Literals(["succeeded", "failed"])),
+});
+export type OrchestratorMcpProviderMaintenanceInput =
+  typeof OrchestratorMcpProviderMaintenanceInput.Type;
+export const OrchestratorMcpProviderMaintenanceResult = Schema.Struct({
+  reservation: OrchestrationV2ProviderMaintenance,
+  mayExecute: Schema.Boolean,
+});
+export type OrchestratorMcpProviderMaintenanceResult =
+  typeof OrchestratorMcpProviderMaintenanceResult.Type;
 const OrchestratorMcpTitle = TrimmedNonEmptyString.check(Schema.isMaxLength(512)).annotate({
   description: "Optional concise display title.",
 });

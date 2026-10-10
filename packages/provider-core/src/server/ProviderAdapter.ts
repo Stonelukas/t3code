@@ -390,6 +390,8 @@ export interface ProviderAdapterV2OpenSessionInput {
   readonly initialNativeThreadId?: string;
   /** Preserves provider item identity across eager activation of a persisted thread. */
   readonly initialProviderItemIdentityVersion?: 2;
+  /** Host-owned reservation correlation; does not itself authorize maintenance. */
+  readonly maintenanceRequestId?: string;
 }
 
 export interface ProviderAdapterV2EnsureThreadInput {
@@ -547,6 +549,22 @@ export interface ProviderAdapterV2SessionRuntime {
    * here so the session manager defers idle release while it is pending.
    */
   readonly hasPendingBackgroundWork?: Effect.Effect<boolean>;
+  /**
+   * Local runtime barrier, not an app idle proof or a native execution lock.
+   * Enter captures concrete native selection; recheck/exit refuse intervening
+   * native activity. The host must retain its durable reservation throughout.
+   */
+  readonly enterMaintenance?: (input: {
+    readonly requestId: string;
+  }) => Effect.Effect<ModelSelection, ProviderAdapterV2Error>;
+  readonly recheckMaintenance?: (input: {
+    readonly requestId: string;
+  }) => Effect.Effect<ModelSelection, ProviderAdapterV2Error>;
+  readonly exitMaintenance?: (input: {
+    readonly requestId: string;
+  }) => Effect.Effect<void, ProviderAdapterV2Error>;
+  /** Observed exit of the owned child, independent of scope-finalizer success. */
+  readonly confirmShutdown?: Effect.Effect<void, ProviderAdapterV2Error>;
   /**
    * Per-provider-thread pending work for root-run ingestion stop gates. When
    * present, RunExecutionService uses only this probe (never the session-wide

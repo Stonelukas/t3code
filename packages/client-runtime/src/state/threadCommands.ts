@@ -5,6 +5,7 @@ import * as Option from "effect/Option";
 import { Atom } from "effect/reactivity";
 import {
   WS_METHODS,
+  ORCHESTRATION_V2_WS_METHODS,
   type EnvironmentId,
   type OrchestrationV2ShellSnapshot,
 } from "@t3tools/contracts";
@@ -46,6 +47,7 @@ import {
   type SnoozeThreadInput,
   type StartThreadTurnInput,
   type StopThreadSessionInput,
+  type RestartPiRpcInput,
   type UnarchiveThreadInput,
   type UnlinkThreadPullRequestInput,
   type UnpinThreadInput,
@@ -82,6 +84,7 @@ import {
   snoozeThread,
   startThreadTurn,
   stopThreadSession,
+  restartPiRpc,
   unarchiveThread,
   unlinkThreadPullRequest,
   unpinThread,
@@ -127,6 +130,7 @@ export type {
   SnoozeThreadInput,
   StartThreadTurnInput,
   StopThreadSessionInput,
+  RestartPiRpcInput,
   ThreadCommandInput,
   UnarchiveThreadInput,
   UnlinkThreadPullRequestInput,
@@ -314,6 +318,13 @@ export function createThreadEnvironmentAtoms<R, E>(
     stopSession: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:stop-session",
       execute: (input: StopThreadSessionInput) => stopThreadSession(input),
+      scheduler,
+      concurrency,
+    }),
+    restartPiRpc: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:commands:thread:restart-pi-rpc",
+      tag: ORCHESTRATION_V2_WS_METHODS.restartPiRpc,
+      execute: (input: RestartPiRpcInput) => restartPiRpc(input),
       scheduler,
       concurrency,
     }),

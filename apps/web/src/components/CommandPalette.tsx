@@ -2,6 +2,7 @@
 
 import { threadPullRequestLinkMode } from "@t3tools/client-runtime/thread-pull-request-compatibility";
 import { visibleThreadPullRequests } from "@t3tools/shared/threadPullRequests";
+import { usePiRpcRestart } from "./chat/PiRpcRestartControl";
 
 import { scopeProjectRef, scopeThreadRef } from "@t3tools/client-runtime/environment";
 import {
@@ -745,6 +746,10 @@ function OpenCommandPaletteDialog(props: {
   const availableSettingsSearchItems = useAvailableSettingsSearchItems();
   const { activeDraftThread, activeThread, defaultProjectRef, handleNewThread } =
     useHandleNewThread();
+  const piRpcRestart = usePiRpcRestart(
+    activeThread?.environmentId ?? null,
+    activeThread?.id ?? null,
+  );
   const projects = useProjects();
   const referenceThreadRef =
     pathname === "/pull-requests"
@@ -1991,7 +1996,22 @@ function OpenCommandPaletteDialog(props: {
     }
   }
 
-  if (activeThread !== null) {
+  if (activeThread !== null && piRpcRestart.isPi && piRpcRestart.saved) {
+    actionItems.push({
+      kind: "action",
+      value: "action:restart-pi-rpc",
+      searchTerms: ["restart", "reload", "pi", "rpc", "agent", "session"],
+      title: "Restart Pi RPC process",
+      description:
+        piRpcRestart.status ??
+        "Keep this thread, saved Pi conversation, and model; send no prompt.",
+      icon: <RotateCcwIcon className={ITEM_ICON_CLASS} />,
+      disabled: !piRpcRestart.available,
+      run: piRpcRestart.restart,
+    });
+  }
+
+  if (activeThread !== null && piRpcRestart.knownNonPi) {
     const thread = activeThread;
     actionItems.push({
       kind: "action",

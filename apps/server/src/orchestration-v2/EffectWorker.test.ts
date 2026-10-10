@@ -1,6 +1,10 @@
 import { assert, it } from "@effect/vitest";
 import {
+  CheckpointScopeId,
   CommandId,
+  type OrchestrationV2ProviderMaintenance,
+  ProjectId,
+  ProviderInstanceId,
   ProviderSessionId,
   ProviderThreadId,
   ProviderTurnId,
@@ -13,6 +17,7 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
@@ -24,6 +29,8 @@ import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EffectWorker from "./EffectWorker.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
+import * as ProviderMaintenanceService from "./ProviderMaintenanceService.ts";
+import * as ProviderMaintenanceAdmission from "./ProviderMaintenanceAdmission.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
 import * as ProviderTurnStartService from "./ProviderTurnStartService.ts";
 import * as RuntimeRequestService from "./RuntimeRequestService.ts";
@@ -82,9 +89,13 @@ function layerExecutorFor(input: {
   readonly threads?: Partial<ThreadManagementService.ThreadManagementService["Service"]>;
   readonly continueAfterRestart?: boolean;
   readonly interrupt?: ProviderTurnControlService.ProviderTurnControlServiceV2Shape["interrupt"];
+  readonly finalize?: RunFinalizationService.RunFinalizationService["Service"]["finalize"];
 }) {
   const record = (event: string) => Ref.update(input.events, (events) => [...events, event]);
   const layerDependencies = Layer.mergeAll(
+    Layer.mock(ProviderMaintenanceService.ProviderMaintenanceService)({
+      execute: () => Effect.die("unused Pi session restart"),
+    }),
     Layer.succeed(
       ProviderTurnControlService.ProviderTurnControlServiceV2,
       ProviderTurnControlService.ProviderTurnControlServiceV2.of({
@@ -130,7 +141,9 @@ function layerExecutorFor(input: {
     ),
     Layer.succeed(
       RunFinalizationService.RunFinalizationService,
-      RunFinalizationService.RunFinalizationService.of({ finalize: () => Effect.void }),
+      RunFinalizationService.RunFinalizationService.of({
+        finalize: input.finalize ?? (() => Effect.void),
+      }),
     ),
     Layer.succeed(
       CheckpointRollbackService.CheckpointRollbackServiceV2,
@@ -159,6 +172,152 @@ function layerExecutorFor(input: {
     ),
   );
 }
+
+it.effect("only the pending Suite reload requesting capture can drain the environment fence", () =>
+  Effect.gen(function* () {
+    const now = yield* DateTime.now;
+    const events = yield* Ref.make<ReadonlyArray<string>>([]);
+    const entered = yield* Deferred.make<void>();
+    const finish = yield* Deferred.make<void>();
+    const base = restartEffect(now, { type: "detach" });
+    const maintenance = {
+      requestId: CommandId.make("suite-reload-drain"),
+      kind: "suite-reload" as const,
+      scope: "environment" as const,
+      providerSessionId: oldSessionId,
+      providerThreadId,
+      requestingRunId: runId,
+      status: "pending" as const,
+      message: null,
+      deadlineEpochMs: DateTime.toEpochMillis(now) + 120_000,
+    };
+    const persisted = yield* Ref.make<OrchestrationV2ProviderMaintenance>(maintenance);
+    let gate: ProviderMaintenanceAdmission.ProviderMaintenanceAdmission["Service"];
+    const layer = layerExecutorFor({
+      events,
+      threads: {
+        getThreadShell: () =>
+          Ref.get(persisted).pipe(
+            Effect.map((providerMaintenance) => ({
+              id: threadId,
+              projectId: ProjectId.make("drain-project"),
+              title: "Drain",
+              providerInstanceId: ProviderInstanceId.make("pi"),
+              modelSelection: { instanceId: ProviderInstanceId.make("pi"), model: "test" },
+              runtimeMode: "full-access" as const,
+              interactionMode: "default" as const,
+              branch: null,
+              worktreePath: null,
+              activeProviderThreadId: providerThreadId,
+              lineage: { rootThreadId: threadId, parentThreadId: null, relationshipToParent: null },
+              forkedFrom: null,
+              createdBy: "user" as const,
+              creationSource: "web" as const,
+              activeRunId: runId,
+              latestRunId: runId,
+              status: "running" as const,
+              pendingRuntimeRequest: null,
+              latestVisibleMessage: null,
+              latestUserMessageAt: null,
+              hasActionableProposedPlan: false,
+              itemCount: 0,
+              visibleItemCount: 0,
+              createdAt: now,
+              updatedAt: now,
+              archivedAt: null,
+              settledOverride: null,
+              settledAt: null,
+              deletedAt: null,
+              providerMaintenance,
+            })),
+          ),
+      },
+      finalize: () =>
+        Effect.gen(function* () {
+          yield* Ref.update(events, (current) => [...current, "capture"]);
+          assert.equal(
+            (yield* gate.withAdmission({ threadId }, Effect.void).pipe(Effect.flip, Effect.orDie))
+              .reason,
+            "reserved",
+          );
+          yield* Deferred.succeed(entered, undefined);
+          yield* Deferred.await(finish);
+        }),
+    });
+    yield* Effect.gen(function* () {
+      gate = yield* ProviderMaintenanceAdmission.ProviderMaintenanceAdmission;
+      const reservation = yield* gate.reserve({
+        scope: "environment",
+        threadId,
+        requestId: maintenance.requestId,
+      });
+      const executor = yield* EffectWorker.OrchestrationEffectExecutorV2;
+      const capture: EffectOutbox.OrchestrationEffectV2 = {
+        ...base,
+        request: {
+          type: "checkpoint.capture",
+          runId,
+          scopeId: CheckpointScopeId.make("drain-scope"),
+        },
+      };
+      for (const refused of [
+        {
+          ...capture,
+          request: {
+            ...capture.request,
+            type: "checkpoint.capture" as const,
+            runId: RunId.make("other-run"),
+            scopeId: CheckpointScopeId.make("drain-scope"),
+          },
+        },
+        { ...base, request: { type: "provider-turn.start" as const, runId } },
+      ]) {
+        const error = yield* executor.execute(refused).pipe(Effect.flip);
+        assert.instanceOf(
+          error.cause,
+          ProviderMaintenanceAdmission.ProviderMaintenanceAdmissionError,
+        );
+      }
+      assert.deepEqual(yield* Ref.get(events), []);
+      const fiber = yield* executor.execute(capture).pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      assert.equal((yield* gate.begin(reservation).pipe(Effect.flip)).reason, "in_flight");
+      yield* Deferred.succeed(finish, undefined);
+      yield* Fiber.join(fiber);
+      assert.deepEqual(yield* Ref.get(events), ["capture"]);
+      for (const mismatch of [
+        { ...maintenance, status: "unknown" as const },
+        { ...maintenance, status: "expired" as const },
+        { ...maintenance, deadlineEpochMs: DateTime.toEpochMillis(now) },
+        { ...maintenance, kind: "pi-rpc-restart" as const },
+        { ...maintenance, scope: "thread" as const },
+        { ...maintenance, requestId: CommandId.make("different-owner") },
+      ]) {
+        yield* Ref.set(persisted, mismatch);
+        const refusal = yield* executor.execute(capture).pipe(Effect.flip);
+        assert.instanceOf(
+          refusal.cause,
+          ProviderMaintenanceAdmission.ProviderMaintenanceAdmissionError,
+        );
+      }
+      yield* Ref.set(persisted, maintenance);
+      const otherThreadCapture = { ...capture, threadId: ThreadId.make("other-capture-thread") };
+      const otherThreadError = yield* executor.execute(otherThreadCapture).pipe(Effect.flip);
+      assert.instanceOf(
+        otherThreadError.cause,
+        ProviderMaintenanceAdmission.ProviderMaintenanceAdmissionError,
+      );
+      yield* gate.begin(reservation);
+      const error = yield* executor.execute(capture).pipe(Effect.flip);
+      assert.instanceOf(
+        error.cause,
+        ProviderMaintenanceAdmission.ProviderMaintenanceAdmissionError,
+      );
+      assert.deepEqual(yield* Ref.get(events), ["capture"]);
+      yield* gate.release(reservation);
+    }).pipe(Effect.provide(layer.pipe(Layer.provideMerge(ProviderMaintenanceAdmission.layer))));
+  }),
+);
 
 it("does not retry pure interrupt races where the turn is already gone", () => {
   assert.isTrue(
@@ -640,6 +799,67 @@ it.effect("keeps a max-attempt replay-safe failure terminal when fail settlement
 
     assert.isTrue(Exit.isFailure(exit));
     assert.equal(yield* Ref.get(failAttempts), 2);
+    assert.equal(yield* Ref.get(retries), 0);
+  }),
+);
+
+it.effect("does not retry an explicit Pi restart failure, even on its first attempt", () =>
+  Effect.gen(function* () {
+    const now = DateTime.formatIso(yield* DateTime.now);
+    const effectId = "effect:explicit-pi-restart";
+    const workerId = "worker:explicit-pi-restart";
+    const requestId = CommandId.make("command:explicit-pi-restart");
+    const claimed: EffectOutbox.OrchestrationEffectV2 = {
+      id: effectId,
+      commandId: requestId,
+      threadId,
+      request: { type: "provider-session.restart", requestId },
+      status: "running",
+      attemptCount: 1,
+      availableAt: now,
+      leaseOwner: workerId,
+      leaseExpiresAt: now,
+      createdAt: now,
+      updatedAt: now,
+      completedAt: null,
+      lastError: null,
+    };
+    const retries = yield* Ref.make(0);
+    const failed = yield* Ref.make(0);
+    const executed = yield* Ref.make<ReadonlyArray<boolean>>([]);
+    const outbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
+      claimNext: () => Effect.succeed(Option.some(claimed)),
+      get: () => Effect.succeed(Option.some(claimed)),
+      awaitCancellation: () => Effect.never,
+      clearCancellation: () => Effect.void,
+      fail: () => Ref.update(failed, (count) => count + 1).pipe(Effect.as(true)),
+      retry: () => Ref.update(retries, (count) => count + 1).pipe(Effect.as(true)),
+    });
+    const executor = Layer.succeed(EffectWorker.OrchestrationEffectExecutorV2, {
+      execute: (_effect, options) =>
+        Ref.update(executed, (values) => [...values, options?.willRetry ?? true]).pipe(
+          Effect.andThen(
+            Effect.fail(
+              new EffectWorker.OrchestrationEffectExecutionError({
+                effectId,
+                effectType: claimed.request.type,
+                cause: "unconfirmed shutdown",
+              }),
+            ),
+          ),
+        ),
+    });
+    const worker = EffectWorker.layerWithOptions({ workerId, maxAttempts: 5 }).pipe(
+      Layer.provide(Layer.merge(outbox, executor)),
+    );
+    assert.isTrue(
+      yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
+        Effect.flatMap((service) => service.runOnce),
+        Effect.provide(worker),
+      ),
+    );
+    assert.deepEqual(yield* Ref.get(executed), [false]);
+    assert.equal(yield* Ref.get(failed), 1);
     assert.equal(yield* Ref.get(retries), 0);
   }),
 );

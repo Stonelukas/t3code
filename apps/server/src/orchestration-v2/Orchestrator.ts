@@ -112,6 +112,13 @@ import * as ProviderContinuationRequests from "@t3tools/provider-core/server/Pro
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import { ProviderSessionManagerV2 } from "./ProviderSessionManager.ts";
+import {
+  ProviderMaintenanceError,
+  ProviderMaintenanceService,
+  providerMaintenanceBlocksWork,
+  providerMaintenanceRefusal,
+} from "./ProviderMaintenanceService.ts";
+import * as MaintenanceAdmission from "./ProviderMaintenanceAdmission.ts";
 import { ProviderSwitchServiceV2 } from "./ProviderSwitchService.ts";
 import { isAutomaticCompletionRun, queuedRunsInDeliveryOrder } from "./QueuedRunOrder.ts";
 import { RuntimePolicyV2 } from "./RuntimePolicy.ts";
@@ -134,6 +141,7 @@ export class OrchestratorDispatchError extends Schema.TaggedError<OrchestratorDi
   {
     commandId: CommandId,
     commandType: Schema.String,
+    notAccepted: Schema.optional(Schema.Boolean),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {
@@ -253,6 +261,7 @@ export function canReplayCommandReceipt(
 }
 
 export const OrchestratorV2Error = Schema.Union([
+  ProviderMaintenanceError,
   OrchestratorDispatchError,
   OrchestratorCommandRejectedError,
   OrchestratorProjectionError,
@@ -454,6 +463,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "thread.interaction-mode.set":
     case "thread.model-selection.set":
     case "provider-session.detach":
+    case "provider-session.restart":
     case "message.dispatch":
     case "notification.delivery.accept":
     case "prepared-run.release":
@@ -829,6 +839,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const runtimePolicy = yield* RuntimePolicyV2;
   const threadForkService = yield* ThreadForkServiceV2;
   const threadDispatch = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+  const admission = yield* MaintenanceAdmission.ProviderMaintenanceAdmission;
+  const maintenance = yield* ProviderMaintenanceService;
 
   const mapDispatchError =
     (command: OrchestrationV2ServerCommand) =>
@@ -1078,7 +1090,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           messageId: delivery.messageId,
         },
       });
-    });
+    }).pipe(
+      (effect) => admission.withAdmission({ threadId }, effect),
+      Effect.catchTags({ ProviderMaintenanceAdmissionError: () => Effect.void }),
+    );
 
   const offerDelegatedCompletionDeliveries = (threadId: ThreadId) =>
     Effect.gen(function* () {
@@ -1270,6 +1285,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (!(yield* projectionStore.canStartQueuedRun(threadId))) return;
       const projection = yield* readCommandProjection(threadId);
       if (
+        providerMaintenanceBlocksWork(projection.thread) ||
         projection.thread.archivedAt !== null ||
         projection.thread.deletedAt !== null ||
         projection.runs.some(isBlockingRun) ||
@@ -1867,7 +1883,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           },
         ],
       );
-    }).pipe(Effect.catch((cause) => failQueuedRunStart(threadId, cause)));
+    }).pipe(
+      Effect.catch((cause) => failQueuedRunStart(threadId, cause)),
+      (effect) => admission.withAdmission({ threadId }, effect),
+      Effect.catchTags({ ProviderMaintenanceAdmissionError: () => Effect.void }),
+    );
 
   const resumeQueuedRuns = Effect.gen(function* () {
     const threadIds = yield* projectionStore.getRecoveryThreadIds("queued-runs");
@@ -3458,6 +3478,86 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         },
       } satisfies PendingOrchestrationEffectV2;
       yield* Ref.update(effects, (existing) => [...existing, pendingEffect]);
+    },
+  );
+
+  const dispatchProviderMaintenance = Effect.fn("orchestrationV2.dispatch.providerMaintenance")(
+    function* (
+      command: Extract<OrchestrationV2Command, { readonly type: "provider-session.restart" }>,
+      events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+      effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+    ) {
+      const projection = yield* projectionStore
+        .getThreadRecords(command.threadId, [
+          "runs",
+          "nodes",
+          "runtimeRequests",
+          "providerSessions",
+          "providerThreads",
+          "providerTurns",
+          "subagents",
+          "turnItems",
+        ])
+        .pipe(mapDispatchError(command));
+      const refusal = providerMaintenanceRefusal(projection);
+      if (refusal !== undefined)
+        return yield* new ProviderMaintenanceError({ threadId: command.threadId, reason: refusal });
+      if (yield* effectOutbox.hasUnsettled(command.threadId).pipe(mapDispatchError(command)))
+        return yield* new ProviderMaintenanceError({
+          threadId: command.threadId,
+          reason: "Wait for the outstanding lifecycle work before restarting Pi RPC.",
+        });
+      const providerThread = projection.providerThreads.find(
+        (thread) => thread.id === projection.thread.activeProviderThreadId,
+      );
+      const session = projection.providerSessions.find(
+        (candidate) => candidate.id === command.providerSessionId,
+      );
+      if (
+        providerThread?.driver !== "pi" ||
+        session?.driver !== "pi" ||
+        providerThread.providerSessionId !== session.id ||
+        providerThread.providerInstanceId !== projection.thread.providerInstanceId ||
+        providerThread.nativeThreadRef?.nativeId === undefined
+      )
+        return yield* new ProviderMaintenanceError({
+          threadId: command.threadId,
+          reason:
+            "Restart is available only for this thread's saved Pi conversation. No new conversation will be created.",
+        });
+      const now = yield* DateTime.now;
+      yield* emit(
+        events,
+        command,
+      )({
+        type: "thread.metadata-updated",
+        threadId: command.threadId,
+        providerInstanceId: projection.thread.providerInstanceId,
+        occurredAt: now,
+        payload: {
+          ...projection.thread,
+          updatedAt: now,
+          providerMaintenance: {
+            requestId: command.commandId,
+            providerSessionId: session.id,
+            providerThreadId: providerThread.id,
+            kind: "pi-rpc-restart",
+            scope: "thread",
+            deadlineEpochMs: DateTime.toEpochMillis(now) + 120_000,
+            status: "pending",
+            message: null,
+          },
+        },
+      });
+      yield* Ref.update(effects, (existing) => [
+        ...existing,
+        {
+          id: `effect:${command.commandId}:provider-session.restart`,
+          commandId: command.commandId,
+          threadId: command.threadId,
+          request: { type: "provider-session.restart", requestId: command.commandId },
+        } satisfies PendingOrchestrationEffectV2,
+      ]);
     },
   );
 
@@ -10147,6 +10247,37 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           readonly reason: string;
         }
       | undefined;
+    // Keep the reservation authoritative for every transport, including native wakes,
+    // prepared runs and scheduled sends. Answers are not passive: message-mode
+    // requests can create a run, and live answers can wake the provider.
+    if (command.type !== "thread.create") {
+      const threadId = commandThreadId(command);
+      const shell = yield* projectionStore.getThreadShell(threadId).pipe(mapDispatchError(command));
+      const passive = [
+        "thread.visit",
+        "thread.mark-unread",
+        "thread.title.regeneration.complete",
+        "thread.pull-request-link.sync",
+        "thread.pull-request.sync",
+        "thread.user-input.dismiss",
+      ];
+      if (shell !== null && providerMaintenanceBlocksWork(shell) && !passive.includes(command.type))
+        return yield* new ProviderMaintenanceError({
+          threadId,
+          reason:
+            "Pi RPC restart is in progress or its shutdown is unconfirmed. New work and lifecycle changes are blocked.",
+        });
+      if (command.type === "thread.fork" || command.type === "thread.merge_back") {
+        const source = yield* projectionStore
+          .getThreadShell(command.sourceThreadId)
+          .pipe(mapDispatchError(command));
+        if (source !== null && providerMaintenanceBlocksWork(source))
+          return yield* new ProviderMaintenanceError({
+            threadId: source.id,
+            reason: "Wait for the source thread's Pi RPC restart before copying its conversation.",
+          });
+      }
+    }
     switch (command.type) {
       case "thread.create":
         yield* dispatchThreadCreate(command, events);
@@ -10245,6 +10376,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         break;
       case "provider-session.detach":
         yield* dispatchProviderSessionDetach(command, events, effects);
+        break;
+      case "provider-session.restart":
+        yield* dispatchProviderMaintenance(command, events, effects);
         break;
       case "message.dispatch": {
         // The provider owns a native subagent's conversation, so a sent
@@ -10625,7 +10759,101 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   });
 
   const dispatchWithReceipt = (command: OrchestrationV2ServerCommand) =>
-    threadDispatch.withLock(commandThreadId(command), dispatchWithReceiptEffect(command));
+    threadDispatch.withLock(
+      commandThreadId(command),
+      Effect.gen(function* () {
+        // Receipt replay is observation, not permission to admit another operation.
+        const receipt = yield* commandReceipts
+          .getByCommandId(command.commandId)
+          .pipe(mapDispatchError(command));
+        if (Option.isSome(receipt)) return yield* dispatchWithReceiptEffect(command);
+        if (command.type === "provider-session.restart") {
+          const request = {
+            scope: "thread" as const,
+            threadId: command.threadId,
+            requestId: command.commandId,
+          };
+          return yield* admission
+            .withMaintenanceAdmission(
+              request,
+              Effect.uninterruptibleMask((restore) =>
+                Effect.gen(function* () {
+                  let transferred = false;
+                  return yield* Effect.acquireUseRelease(
+                    admission.reserve(request),
+                    () =>
+                      Effect.gen(function* () {
+                        const result = yield* restore(dispatchWithReceiptEffect(command));
+                        transferred = true;
+                        yield* maintenance.armDeadline({
+                          threadId: command.threadId,
+                          requestId: command.commandId,
+                        });
+                        return result;
+                      }),
+                    (reservation) =>
+                      transferred
+                        ? Effect.void
+                        : Effect.gen(function* () {
+                            const receipt = yield* commandReceipts.getByCommandId(
+                              command.commandId,
+                            );
+                            if (Option.isSome(receipt) && receipt.value.status === "accepted")
+                              yield* maintenance.armDeadline({
+                                threadId: command.threadId,
+                                requestId: command.commandId,
+                              });
+                            else yield* admission.release(reservation);
+                          }),
+                  );
+                }),
+              ),
+            )
+            .pipe(mapDispatchError(command));
+        }
+        if (["thread.visit", "thread.mark-unread"].includes(command.type))
+          return yield* dispatchWithReceiptEffect(command);
+        return yield* admission
+          .withAdmission(
+            command.type === "thread.fork" || command.type === "thread.merge_back"
+              ? {}
+              : { threadId: commandThreadId(command) },
+            dispatchWithReceiptEffect(command),
+          )
+          .pipe(
+            Effect.catchTags({
+              ProviderMaintenanceAdmissionError: (cause) =>
+                Effect.fail(
+                  new OrchestratorDispatchError({
+                    commandId: command.commandId,
+                    commandType: command.type,
+                    cause,
+                  }),
+                ),
+            }),
+          );
+      }).pipe(
+        Effect.catch((cause) =>
+          command.type !== "provider-session.restart"
+            ? Effect.fail(cause)
+            : Effect.gen(function* () {
+                // Reconcile the exact receipt while still serialized, before telling a client it may retry.
+                const receipt = yield* commandReceipts
+                  .getByCommandId(command.commandId)
+                  .pipe(Effect.option);
+                const notAccepted =
+                  Option.isSome(receipt) &&
+                  (Option.isNone(receipt.value) || receipt.value.value.status === "rejected");
+                return yield* new OrchestratorDispatchError({
+                  commandId: command.commandId,
+                  commandType: command.type,
+                  notAccepted,
+                  cause,
+                });
+              }),
+        ),
+      ),
+    );
 
   const handleTerminalRun = (stored: OrchestrationV2StoredEvent) =>
     Effect.gen(function* () {
@@ -10959,12 +11187,14 @@ export const layer: Layer.Layer<
   | ProjectStore.ProjectStoreV2
   | ProviderAdapterRegistryV2
   | ProviderSessionManagerV2
+  | ProviderMaintenanceService
   | ProviderSwitchServiceV2
   | ProjectionStoreV2
   | RuntimePolicyV2
   | ThreadForkServiceV2
 > = Layer.effect(OrchestratorV2, makeOrchestrator()).pipe(
   Layer.provide(ThreadCommandExecutor.layer),
+  Layer.provide(MaintenanceAdmission.layer),
 );
 
 const layerUnavailable: Layer.Layer<OrchestratorV2> = Layer.succeed(

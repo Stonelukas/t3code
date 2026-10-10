@@ -54,6 +54,18 @@ installs Pi's example `subagent` extension, T3 Code also shows its task progress
 UI. Pi runs those children without a session, so they cannot be opened or resumed as T3 Code
 threads.
 
+## Restart the Pi RPC Process
+
+In web and desktop, open Thread Details or the command palette and choose **Restart Pi RPC
+process**. Confirm only after the thread has finished its work and has no pending questions,
+background tasks, delegated work, or queued messages. The server checks these conditions again.
+
+Restart keeps the same T3 thread, saved native Pi conversation, effective model, and thinking level.
+It sends no prompt and does not continue or replay a turn. In-memory extension state, including
+Notebook runtime bindings, may be lost. Thread Details reports the outcome; acceptance alone does
+not mean the restart completed. An unknown outcome blocks new work and must be investigated before
+another attempt. This action is not currently exposed in the mobile client.
+
 ## Troubleshooting
 
 - If Pi is unavailable, confirm that the configured binary runs on the server machine, then refresh

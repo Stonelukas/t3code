@@ -36,6 +36,7 @@ import * as ThreadTitleRegenerationService from "./ThreadTitleRegenerationServic
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
+import * as ProviderMaintenanceService from "./ProviderMaintenanceService.ts";
 import * as ProviderRuntimeRecoveryService from "./ProviderRuntimeRecoveryService.ts";
 import * as ProviderSwitchService from "./ProviderSwitchService.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
@@ -136,6 +137,18 @@ const layerProviderSessionManagerProvided = ProviderSessionManager.layer.pipe(
   ),
 );
 
+const layerProviderMaintenanceProvided = ProviderMaintenanceService.layer.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      layerStores,
+      layerEventSinkProvided,
+      IdAllocator.layer,
+      layerProviderSessionManagerProvided,
+      layerRuntimePolicyProvided,
+      ThreadCommandExecutor.layer,
+    ),
+  ),
+);
 const layerProviderAuthServiceProvided = ProviderAuthService.layer.pipe(
   Layer.provide(Layer.merge(ProjectionStore.layer, layerProviderSessionManagerProvided)),
 );
@@ -220,6 +233,7 @@ const layerOrchestratorProvided = Orchestrator.layer.pipe(
       layerRuntimePolicyProvided,
       layerProviderSessionManagerProvided,
       layerProviderSwitchServiceProvided,
+      layerProviderMaintenanceProvided,
       layerRunExecutionServiceProvided,
       ThreadForkService.layer,
     ),
@@ -295,6 +309,7 @@ const layerEffectExecutorProvided = EffectWorker.layerExecutor.pipe(
       layerRunFinalizationServiceProvided,
       layerCheckpointRollbackServiceProvided,
       layerProviderSessionManagerProvided,
+      layerProviderMaintenanceProvided,
       layerProviderTurnControlServiceProvided,
       layerProviderTurnStartServiceProvided,
       layerRuntimeRequestServiceProvided,
@@ -335,6 +350,7 @@ export const layer = Layer.mergeAll(
   layerThreadManagementProvided,
   layerEffectWorkerProvided,
   layerProviderSessionManagerProvided,
+  layerProviderMaintenanceProvided,
   layerProviderAuthServiceProvided,
   layerProviderRuntimeRecoveryProvided,
   layerProjectionMaintenanceProvided,

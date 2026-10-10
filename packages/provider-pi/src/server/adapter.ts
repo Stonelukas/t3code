@@ -496,6 +496,26 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         ProviderAdapter.ProviderAdapterProtocolError
       > | null = null;
       let closed = false;
+      let processedNativeActivityVersion = 0;
+      let turnSetups = 0;
+      const trackTurnSetup = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+        Effect.acquireUseRelease(
+          Effect.sync(() => {
+            turnSetups += 1;
+          }),
+          () => effect,
+          () =>
+            Effect.sync(() => {
+              turnSetups -= 1;
+            }),
+        );
+      let maintenance: { requestId: string; activityVersion: number } | null =
+        input.maintenanceRequestId === undefined
+          ? null
+          : {
+              requestId: input.maintenanceRequestId,
+              activityVersion: connection.nativeActivityVersion(),
+            };
       yield* Effect.addFinalizer(() =>
         Effect.gen(function* () {
           closed = true;
@@ -1243,7 +1263,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         if (nativeRequestId === undefined) return;
         const approvalTitle = recordString(event, "title") ?? "";
         const approvalKey = `${approvalTitle.length}:${approvalTitle}${recordString(event, "message") ?? ""}`;
-        if (method === "confirm" && sessionApprovals.has(approvalKey)) {
+        if (maintenance === null && method === "confirm" && sessionApprovals.has(approvalKey)) {
           yield* connection.send({
             type: "extension_ui_response",
             id: nativeRequestId,
@@ -1645,6 +1665,13 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         const turn = state?.activeTurn ?? null;
         switch (event["type"]) {
           case "agent_start": {
+            if (maintenance !== null && turn === null && state !== null) {
+              // Record the wake, but never schedule or answer native work on
+              // behalf of maintenance. The barrier remains invalidated.
+              pendingWake = { state, events: [event] };
+              yield* updateProviderSession("running", null);
+              return;
+            }
             if (
               turn === null &&
               state?.providerThread.appThreadId != null &&
@@ -2083,7 +2110,16 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
       yield* Effect.gen(function* () {
         while (true) {
           const event = yield* Queue.take(connection.events);
-          yield* sessionEventPermit.withPermits(1)(handleSessionEvent(event));
+          yield* sessionEventPermit.withPermits(1)(
+            handleSessionEvent(event).pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  if (event["type"] !== "response" && !String(event["type"]).startsWith("t3."))
+                    processedNativeActivityVersion += 1;
+                }),
+              ),
+            ),
+          );
         }
       }).pipe(
         Effect.catchCause((cause) =>
@@ -2144,6 +2180,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
       const registerThread = Effect.fnUntraced(function* (
         threadInput: ProviderAdapter.ProviderAdapterV2EnsureThreadInput,
         publish = true,
+        verifyResume = false,
       ) {
         if (rollbackBarrier !== null)
           return yield* protocolError("Cannot register a Pi thread during rollback");
@@ -2188,6 +2225,12 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           if (recordField(result, "cancelled") === true) {
             return yield* protocolError("A Pi extension cancelled the session switch");
           }
+          // Pi's switch ack normally contains only `cancelled`; get_state
+          // below is authoritative. Check an ack identity too if supplied.
+          const switchedFile = recordString(result, "sessionFile");
+          if (verifyResume && switchedFile !== undefined && switchedFile !== resumeId) {
+            return yield* protocolError("Pi switched to a different session file", result);
+          }
         }
         const stateData = yield* request({ type: "get_state" });
         if (!modelsDiscovered) {
@@ -2219,6 +2262,9 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         const nativeId = recordString(stateData, "sessionFile");
         if (nativeId === undefined) {
           return yield* protocolError("get_state returned no persisted sessionFile", stateData);
+        }
+        if (verifyResume && nativeId !== resumeId) {
+          return yield* protocolError("Pi resumed a different session file", stateData);
         }
         if (needsNewSession && nativeId === lastNativeThreadId) {
           return yield* protocolError("Pi did not create a distinct session file");
@@ -2276,7 +2322,10 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         return providerThread;
       });
 
-      const applySelection = Effect.fnUntraced(function* (modelSelection: ModelSelection) {
+      const applySelection = Effect.fnUntraced(function* (
+        modelSelection: ModelSelection,
+        publish = true,
+      ) {
         const thinking = getModelSelectionStringOptionValue(modelSelection, "thinking");
         if (modelSelection.model === PI_INHERIT_MODEL_SLUG) {
           // Returning to "Pi default" after an explicit pick has to replay the
@@ -2287,11 +2336,12 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             appliedModel = null;
             const updatedAt = yield* DateTime.now;
             sessionEntity = { ...sessionEntity, model: PI_INHERIT_MODEL_SLUG, updatedAt };
-            yield* emit({
-              type: "provider_session.updated",
-              driver: PI_PROVIDER,
-              providerSession: sessionEntity,
-            });
+            if (publish)
+              yield* emit({
+                type: "provider_session.updated",
+                driver: PI_PROVIDER,
+                providerSession: sessionEntity,
+              });
           }
           // The "Pi default" model advertises no thinking choices of its own,
           // so an unqualified return also restores Pi's configured level
@@ -2321,11 +2371,12 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           appliedModel = modelSelection.model;
           const updatedAt = yield* DateTime.now;
           sessionEntity = { ...sessionEntity, model: modelSelection.model, updatedAt };
-          yield* emit({
-            type: "provider_session.updated",
-            driver: PI_PROVIDER,
-            providerSession: sessionEntity,
-          });
+          if (publish)
+            yield* emit({
+              type: "provider_session.updated",
+              driver: PI_PROVIDER,
+              providerSession: sessionEntity,
+            });
         }
         if (
           thinking !== undefined &&
@@ -2361,6 +2412,52 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         return { message, images };
       });
 
+      const checkMaintenance = (requestId: string) =>
+        Effect.gen(function* () {
+          const barrier = maintenance;
+          if (barrier === null || barrier.requestId !== requestId || requestId.length === 0)
+            return yield* protocolError("Pi maintenance reservation does not match");
+          const state = yield* request({ type: "get_state" }).pipe(
+            Effect.mapError((cause) => protocolError("Pi maintenance state probe failed", cause)),
+          );
+          if (
+            closed ||
+            stopRequested ||
+            rollbackBarrier !== null ||
+            threadState === null ||
+            threadState.activeTurn !== null ||
+            turnSetups > 0 ||
+            pendingWake !== null ||
+            pendingPrompts.size > 0 ||
+            pendingPromptResponses.length > 0 ||
+            pendingCompactResponses.length > 0 ||
+            unsolicitedActivityDetected ||
+            connection.nativeActivityVersion() !== barrier.activityVersion ||
+            connection.nativeActivityVersion() !== processedNativeActivityVersion ||
+            recordField(state, "isStreaming") !== false ||
+            recordField(state, "isCompacting") !== false ||
+            recordNumber(state, "pendingMessageCount") !== 0 ||
+            recordString(state, "sessionFile") !==
+              threadState.providerThread.nativeThreadRef?.nativeId
+          )
+            return yield* protocolError(
+              "Pi maintenance refused: native runtime is busy or changed",
+            );
+          const model = recordField(state, "model");
+          const provider = recordString(model, "provider");
+          const modelId = recordString(model, "id");
+          const thinking = recordString(state, "thinkingLevel");
+          if (!provider || !modelId || !thinking || !PI_THINKING_LEVELS.has(thinking))
+            return yield* protocolError(
+              "Pi maintenance requires a concrete native model and thinking level",
+            );
+          return {
+            instanceId: options.instanceId,
+            model: `${provider}/${modelId}`,
+            options: [{ id: "thinking", value: thinking }],
+          } satisfies ModelSelection;
+        });
+
       const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
         instanceId: options.instanceId,
         driver: PI_PROVIDER,
@@ -2369,6 +2466,53 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           return sessionEntity;
         },
         events: Stream.fromQueue(events),
+        confirmShutdown: connection.confirmShutdown.pipe(
+          Effect.mapError((cause) => protocolError("Pi process exit was not confirmed", cause)),
+        ),
+        enterMaintenance: ({ requestId }) =>
+          sessionEventPermit.withPermits(1)(
+            Effect.gen(function* () {
+              if (
+                requestId.length === 0 ||
+                (maintenance !== null && maintenance.requestId !== requestId)
+              )
+                return yield* protocolError("Pi maintenance reservation does not match");
+              const previous = maintenance;
+              maintenance ??= { requestId, activityVersion: connection.nativeActivityVersion() };
+              return yield* checkMaintenance(requestId).pipe(
+                Effect.onError(() =>
+                  Effect.sync(() => {
+                    if (
+                      previous === null &&
+                      maintenance?.activityVersion === connection.nativeActivityVersion()
+                    )
+                      maintenance = null;
+                  }),
+                ),
+                Effect.onInterrupt(() =>
+                  Effect.sync(() => {
+                    if (
+                      previous === null &&
+                      maintenance?.activityVersion === connection.nativeActivityVersion()
+                    )
+                      maintenance = null;
+                  }),
+                ),
+              );
+            }),
+          ),
+        recheckMaintenance: ({ requestId }) =>
+          sessionEventPermit.withPermits(1)(checkMaintenance(requestId)),
+        exitMaintenance: ({ requestId }) =>
+          sessionEventPermit.withPermits(1)(
+            checkMaintenance(requestId).pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  maintenance = null;
+                }),
+              ),
+            ),
+          ),
         hasPendingBackgroundWork: Effect.sync(() => pendingWake !== null),
         hasPendingBackgroundWorkForThread: (providerThread) =>
           Effect.sync(
@@ -2396,12 +2540,61 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             ),
           ),
         resumeThread: (threadInput) =>
-          registerThread({
-            threadId:
-              threadInput.threadId ?? threadInput.providerThread.appThreadId ?? input.threadId,
-            modelSelection: threadInput.modelSelection ?? input.modelSelection,
-            runtimePolicy: threadInput.runtimePolicy ?? input.runtimePolicy,
-            existingProviderThread: threadInput.providerThread,
+          Effect.gen(function* () {
+            const nativeId = threadInput.providerThread.nativeThreadRef?.nativeId;
+            if (nativeId == null) {
+              return yield* protocolError(
+                "Cannot resume a Pi thread without a native session file",
+              );
+            }
+            if (pendingWake !== null) {
+              return yield* protocolError("Cannot resume Pi while native work is awaiting a turn");
+            }
+            const selection = threadInput.modelSelection ?? input.modelSelection;
+            const providerThread = yield* registerThread(
+              {
+                threadId:
+                  threadInput.threadId ?? threadInput.providerThread.appThreadId ?? input.threadId,
+                modelSelection: selection,
+                runtimePolicy: threadInput.runtimePolicy ?? input.runtimePolicy,
+                existingProviderThread: threadInput.providerThread,
+              },
+              false,
+              true,
+            );
+            return yield* Effect.gen(function* () {
+              yield* applySelection(selection, false);
+              // Thinking setters can clamp unsupported levels; an RPC ack alone
+              // does not establish that the requested selection was restored.
+              const state = yield* request({ type: "get_state" });
+              const model = recordField(state, "model");
+              const thinking = getModelSelectionStringOptionValue(selection, "thinking");
+              if (
+                recordString(state, "sessionFile") !== nativeId ||
+                (selection.model !== PI_INHERIT_MODEL_SLUG &&
+                  `${recordString(model, "provider")}/${recordString(model, "id")}` !==
+                    selection.model) ||
+                (thinking !== undefined && recordString(state, "thinkingLevel") !== thinking)
+              ) {
+                return yield* protocolError(
+                  "Pi did not restore the requested session selection",
+                  state,
+                );
+              }
+              yield* emit({
+                type: "provider_session.updated",
+                driver: PI_PROVIDER,
+                providerSession: sessionEntity,
+              });
+              yield* emit({ type: "provider_thread.updated", driver: PI_PROVIDER, providerThread });
+              return providerThread;
+            }).pipe(
+              Effect.onError(() =>
+                Effect.sync(() => {
+                  threadState = null;
+                }),
+              ),
+            );
           }).pipe(
             Effect.mapError(
               (cause) =>
@@ -2422,6 +2615,8 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           }),
         startTurn: (turnInput) =>
           Effect.gen(function* () {
+            if (maintenance !== null)
+              return yield* protocolError("Cannot start a Pi turn during maintenance");
             if (rollbackBarrier !== null)
               return yield* protocolError("Cannot start a Pi turn during rollback");
             const state = threadState;
@@ -2526,6 +2721,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                 closed ||
                 stopRequested ||
                 rollbackBarrier !== null ||
+                maintenance !== null ||
                 state.providerThread.nativeThreadRef?.nativeId !==
                   turnInput.providerThread.nativeThreadRef?.nativeId
               ) {
@@ -2597,6 +2793,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             // Rejections therefore return later as id-less response records
             // handled by the event pump.
           }).pipe(
+            trackTurnSetup,
             Effect.mapError(
               (cause) =>
                 new ProviderAdapter.ProviderAdapterTurnStartError({

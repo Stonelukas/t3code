@@ -18,8 +18,13 @@ import {
   TurnItemId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Ref from "effect/Ref";
+import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
@@ -27,7 +32,9 @@ import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
-import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import * as ProviderMaintenance from "./ProviderMaintenanceService.ts";
+import * as ProviderSessions from "./ProviderSessionManager.ts";
+import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
 const instanceId = ProviderInstanceId.make("codex");
 const modelSelection = { instanceId, model: "gpt-5.1-codex" };
@@ -39,14 +46,731 @@ const adapter = {
   openSession: () => Effect.die("No provider process needed for metadata controls"),
 } as ProviderAdapter.ProviderAdapterV2["Service"];
 const layerDatabase = SqlitePersistence.layerMemory;
+const piInstanceId = ProviderInstanceId.make("pi_control_test");
+const piAdapter = { ...adapter, instanceId: piInstanceId, driver: ProviderDriverKind.make("pi") };
 const layerTest = Layer.mergeAll(
   layerDatabase,
   ProjectionStore.layer.pipe(Layer.provide(layerDatabase)),
   ProviderReplayHarness.layerWithRegistry(
     { name: "control-reads" },
-    ProviderAdapterRegistry.layerFromAdapters([adapter]),
+    ProviderAdapterRegistry.layerFromAdapters([adapter, piAdapter]),
     { databaseLayer: layerDatabase, runEffectWorker: false },
   ),
+);
+
+it.effect.each(["normal", "failed-open", "late-restart"] as const)(
+  "maintains the saved Pi conversation and never replays uncertain maintenance: %s",
+  (scenario) =>
+    Effect.gen(function* () {
+      const trace = yield* Ref.make<ReadonlyArray<string>>([]);
+      const failResume = yield* Ref.make(false);
+      const failOpen = yield* Ref.make(false);
+      const delayedResume = yield* Ref.make(false);
+      const resumeEntered = yield* Deferred.make<void>();
+      const slowProbe = yield* Ref.make(false);
+      const probeEntered = yield* Deferred.make<void>();
+      const pauseInspection = yield* Ref.make(false);
+      const inspectionEntered = yield* Deferred.make<void>();
+      const selection = {
+        instanceId: piInstanceId,
+        model: "openai-codex/gpt-6.1-sol",
+        options: [{ id: "thinking", value: "high" }],
+      };
+      const capabilities = {
+        ...CodexProviderCapabilitiesV2,
+        sessions: {
+          ...CodexProviderCapabilitiesV2.sessions,
+          supportsMultipleProviderThreadsPerSession: false,
+        },
+      };
+      const fakePi = ProviderAdapter.ProviderAdapterV2.of({
+        instanceId: piInstanceId,
+        driver: piAdapter.driver,
+        getCapabilities: () => Effect.succeed(capabilities),
+        planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" }),
+        openSession: (input) =>
+          Effect.gen(function* () {
+            yield* Ref.update(trace, (current) => [
+              ...current,
+              `open:${input.providerSessionId}:${input.modelSelection.model}`,
+            ]);
+            yield* Effect.addFinalizer(() =>
+              Ref.update(trace, (current) => [...current, "shutdown"]),
+            );
+            if (yield* Ref.get(failOpen))
+              return yield* Effect.die("Synthetic initialization failure after spawn");
+            const now = yield* DateTime.now;
+            let requestId = input.maintenanceRequestId;
+            return {
+              instanceId: piInstanceId,
+              driver: piAdapter.driver,
+              providerSessionId: input.providerSessionId,
+              providerSession: {
+                id: input.providerSessionId,
+                driver: piAdapter.driver,
+                providerInstanceId: piInstanceId,
+                status: "ready",
+                cwd: input.runtimePolicy.cwd ?? process.cwd(),
+                model: selection.model,
+                capabilities,
+                createdAt: now,
+                updatedAt: now,
+                lastError: null,
+              },
+              events: Stream.never,
+              hasPendingBackgroundWork: Effect.gen(function* () {
+                if (yield* Ref.get(pauseInspection)) {
+                  yield* Deferred.succeed(inspectionEntered, undefined);
+                  return yield* Effect.never;
+                }
+                return false;
+              }),
+              confirmShutdown: Ref.update(trace, (current) => [...current, "confirmed"]),
+              enterMaintenance: (owner) =>
+                Effect.sync(() => {
+                  requestId = owner.requestId;
+                  return selection;
+                }),
+              recheckMaintenance: (owner) =>
+                Effect.gen(function* () {
+                  if (requestId !== owner.requestId)
+                    return yield* Effect.die("Wrong maintenance owner");
+                  if (yield* Ref.get(slowProbe)) {
+                    yield* Deferred.succeed(probeEntered, undefined);
+                    yield* Effect.sleep("120 seconds");
+                  }
+                  return selection;
+                }),
+              exitMaintenance: (owner) =>
+                Effect.sync(() => {
+                  assert.equal(requestId, owner.requestId);
+                  requestId = undefined;
+                }),
+              resumeThread: (resume) =>
+                Effect.gen(function* () {
+                  yield* Ref.update(trace, (current) => [
+                    ...current,
+                    `resume:${resume.providerThread.nativeThreadRef?.nativeId}:${resume.modelSelection?.model}:${resume.modelSelection?.options?.[0]?.value}`,
+                  ]);
+                  if (yield* Ref.get(failResume))
+                    return yield* Effect.die("Synthetic resume failure");
+                  if (yield* Ref.get(delayedResume)) {
+                    yield* Deferred.succeed(resumeEntered, undefined);
+                    yield* Effect.sleep("10 seconds");
+                  }
+                  return resume.providerThread;
+                }),
+              ensureThread: () => Effect.die("No new native conversation"),
+              startTurn: () => Effect.die("No prompt or continuation"),
+              steerTurn: () => Effect.die("No steering"),
+              interruptTurn: () => Effect.die("No active turn"),
+              respondToRuntimeRequest: () => Effect.die("No answer"),
+              readThreadSnapshot: () => Effect.die("No history read"),
+              rollbackThread: () => Effect.die("No rollback"),
+              forkThread: () => Effect.die("No fork"),
+            } satisfies ProviderAdapter.ProviderAdapterV2SessionRuntime;
+          }),
+      });
+      const database = SqlitePersistence.layerMemory;
+      const testLayer = Layer.mergeAll(
+        database,
+        ProjectionStore.layer.pipe(Layer.provide(database)),
+        ProviderReplayHarness.layerWithRegistry(
+          { name: "pi-maintenance-service" },
+          ProviderAdapterRegistry.layerFromAdapters([fakePi, adapter]),
+          { databaseLayer: database, runEffectWorker: false },
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        const sessions = yield* ProviderSessions.ProviderSessionManagerV2;
+        const maintenance = yield* ProviderMaintenance.ProviderMaintenanceService;
+        const threadId = ThreadId.make("thread:maintenance-service");
+        const otherThreadId = ThreadId.make("thread:maintenance-other");
+        const sessionId = ProviderSessionId.make("session:maintenance-service");
+        const providerThreadId = ProviderThreadId.make("provider-thread:maintenance-service");
+        for (const id of [threadId, otherThreadId])
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make(`create:${id}`),
+            threadId: id,
+            projectId: ProjectId.make("project:maintenance-service"),
+            title: "Synthetic maintenance test",
+            modelSelection:
+              id === threadId ? { instanceId: piInstanceId, model: "default" } : modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            createdBy: "user",
+            creationSource: "web",
+          });
+        const runtimePolicy = {
+          runtimeMode: "full-access" as const,
+          interactionMode: "default" as const,
+          cwd: process.cwd(),
+        };
+        yield* sessions.open({
+          threadId,
+          providerSessionId: sessionId,
+          modelSelection: { instanceId: piInstanceId, model: "default" },
+          runtimePolicy,
+        });
+        const now = yield* DateTime.now;
+        yield* projections.apply({
+          id: EventId.make("maintenance-native"),
+          type: "provider-thread.updated",
+          threadId,
+          occurredAt: now,
+          payload: {
+            id: providerThreadId,
+            driver: piAdapter.driver,
+            providerInstanceId: piInstanceId,
+            providerSessionId: sessionId,
+            appThreadId: threadId,
+            ownerNodeId: null,
+            nativeThreadRef: {
+              driver: piAdapter.driver,
+              nativeId: "/synthetic/saved-pi-session.jsonl",
+              strength: "strong",
+            },
+            nativeConversationHeadRef: null,
+            status: "idle",
+            firstRunOrdinal: 1,
+            lastRunOrdinal: 1,
+            handoffIds: [],
+            forkedFrom: null,
+            createdAt: now,
+            updatedAt: now,
+          },
+        });
+        yield* projections.apply({
+          id: EventId.make("maintenance-active"),
+          type: "thread.metadata-updated",
+          threadId,
+          occurredAt: now,
+          payload: {
+            ...(yield* projections.getThread(threadId)),
+            activeProviderThreadId: providerThreadId,
+          },
+        });
+        const restart = {
+          type: "provider-session.restart" as const,
+          commandId: CommandId.make("restart:maintenance-service"),
+          threadId,
+          providerSessionId: sessionId,
+        };
+        yield* orchestrator.dispatch(restart);
+        yield* maintenance.execute({ threadId, requestId: restart.commandId });
+        yield* maintenance.execute({ threadId, requestId: restart.commandId });
+        assert.deepEqual(yield* Ref.get(trace), [
+          `open:${sessionId}:default`,
+          "shutdown",
+          "confirmed",
+          `open:${sessionId}:${selection.model}`,
+          `resume:/synthetic/saved-pi-session.jsonl:${selection.model}:high`,
+        ]);
+        const restarted = yield* projections.getThreadProjection(threadId);
+        assert.equal(restarted.thread.providerMaintenance?.status, "succeeded");
+        assert.equal(restarted.thread.activeProviderThreadId, providerThreadId);
+        assert.lengthOf(restarted.runs, 0);
+        assert.lengthOf(restarted.messages, 0);
+        // A settled runtime must remain visible without any retained timeline cohort.
+        const bounded = yield* projections.getThreadSnapshotWindow(threadId, {
+          rowLimit: 1,
+          userTurnLimit: 1,
+        });
+        assert.deepEqual(
+          bounded.projection.providerThreads.map((thread) => thread.id),
+          [providerThreadId],
+        );
+        assert.deepEqual(
+          bounded.projection.providerSessions.map((session) => session.id),
+          [sessionId],
+        );
+        assert.deepEqual(
+          restarted.providerThreads.map((thread) => thread.id),
+          [providerThreadId],
+        );
+        assert.deepEqual(
+          restarted.providerSessions.map((session) => session.id),
+          [sessionId],
+        );
+        // Simulate the effect worker's receipt after the directly invoked service completed.
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`UPDATE orchestration_v2_effect_outbox SET status = 'succeeded' WHERE thread_id = ${threadId}`;
+        if (scenario !== "normal") {
+          const uncertainRestart = { ...restart, commandId: CommandId.make(`restart:${scenario}`) };
+          yield* orchestrator.dispatch(uncertainRestart);
+          if (scenario === "failed-open") {
+            yield* Ref.set(failOpen, true);
+            assert.equal(
+              (yield* Effect.exit(
+                maintenance.execute({ threadId, requestId: uncertainRestart.commandId }),
+              ))._tag,
+              "Failure",
+            );
+          } else {
+            yield* TestClock.adjust("115 seconds");
+            yield* Ref.set(delayedResume, true);
+            const attempt = yield* Effect.exit(
+              maintenance.execute({ threadId, requestId: uncertainRestart.commandId }),
+            ).pipe(Effect.forkChild);
+            yield* Deferred.await(resumeEntered);
+            yield* TestClock.adjust("10 seconds");
+            assert.equal((yield* Fiber.join(attempt))._tag, "Failure");
+          }
+          assert.equal(
+            (yield* projections.getThread(threadId)).providerMaintenance?.status,
+            "unknown",
+          );
+          assert.equal(
+            (yield* Effect.exit(
+              sessions.open({
+                threadId,
+                providerSessionId: sessionId,
+                modelSelection: selection,
+                runtimePolicy,
+              }),
+            ))._tag,
+            "Failure",
+          );
+          assert.equal(
+            (yield* Effect.exit(
+              maintenance.execute({ threadId, requestId: uncertainRestart.commandId }),
+            ))._tag,
+            "Failure",
+          );
+          assert.lengthOf((yield* projections.getThreadProjection(threadId)).runs, 0);
+          assert.lengthOf((yield* projections.getThreadProjection(threadId)).messages, 0);
+          return;
+        }
+        const expiresRestart = {
+          ...restart,
+          commandId: CommandId.make("restart:expire-before-execute"),
+        };
+        yield* orchestrator.dispatch(expiresRestart);
+        yield* TestClock.adjust("121 seconds");
+        assert.equal(
+          (yield* Effect.exit(
+            maintenance.execute({ threadId, requestId: expiresRestart.commandId }),
+          ))._tag,
+          "Failure",
+        );
+        assert.equal(
+          (yield* projections.getThread(threadId)).providerMaintenance?.status,
+          "expired",
+        );
+        assert.lengthOf(yield* Ref.get(trace), 5);
+        yield* sql`UPDATE orchestration_v2_effect_outbox SET status = 'succeeded' WHERE thread_id = ${threadId}`;
+        yield* Ref.set(failResume, true);
+        const failedRestart = { ...restart, commandId: CommandId.make("restart:resume-fails") };
+        yield* orchestrator.dispatch(failedRestart);
+        assert.equal(
+          (yield* Effect.exit(
+            maintenance.execute({ threadId, requestId: failedRestart.commandId }),
+          ))._tag,
+          "Failure",
+        );
+        assert.equal(
+          (yield* projections.getThread(threadId)).providerMaintenance?.status,
+          "failed",
+        );
+        assert.deepEqual((yield* Ref.get(trace)).slice(-2), ["shutdown", "confirmed"]);
+        assert.equal(
+          (yield* Effect.exit(
+            maintenance.execute({ threadId, requestId: failedRestart.commandId }),
+          ))._tag,
+          "Failure",
+        );
+        yield* Ref.set(failResume, false);
+        // A safe failed attempt releases admission; reopen our synthetic runtime for the reload cases.
+        yield* sessions.open({
+          threadId,
+          providerSessionId: sessionId,
+          modelSelection: selection,
+          runtimePolicy,
+        });
+        yield* sql`UPDATE orchestration_v2_effect_outbox SET status = 'succeeded' WHERE thread_id = ${threadId}`;
+        const caller = {
+          threadId,
+          providerSessionId: sessionId,
+          providerInstanceId: piInstanceId,
+          namespace: "synthetic-incarnation",
+          issuedAt: 1,
+        };
+        yield* Ref.set(pauseInspection, true);
+        const interruptedReserve = yield* maintenance
+          .sharedReload({
+            caller,
+            requestId: CommandId.make("reload:interrupted-inspection"),
+            phase: "reserve",
+          })
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(inspectionEntered);
+        yield* Fiber.interrupt(interruptedReserve);
+        yield* Ref.set(pauseInspection, false);
+        yield* orchestrator.dispatch({
+          type: "thread.model-selection.set",
+          commandId: CommandId.make("interrupted-reserve-released"),
+          threadId: otherThreadId,
+          modelSelection,
+        });
+        assert.equal(
+          (yield* projections.getThread(threadId)).providerMaintenance?.requestId,
+          failedRestart.commandId,
+        );
+        const requestId = CommandId.make("reload:maintenance-service");
+        const reserved = yield* maintenance.sharedReload({ caller, requestId, phase: "reserve" });
+        assert.equal(reserved.reservation.status, "pending");
+        assert.isFalse(reserved.mayExecute);
+        const blocked = yield* Effect.exit(
+          orchestrator.dispatch({
+            type: "thread.model-selection.set",
+            commandId: CommandId.make("blocked-other-model"),
+            threadId: otherThreadId,
+            modelSelection,
+          }),
+        );
+        assert.equal(blocked._tag, "Failure");
+        assert.equal(
+          (yield* Effect.exit(
+            sessions.open({
+              threadId: otherThreadId,
+              providerSessionId: ProviderSessionId.make("session:blocked-cold-open"),
+              modelSelection,
+              runtimePolicy,
+            }),
+          ))._tag,
+          "Failure",
+        );
+        assert.equal(
+          (yield* Effect.exit(
+            maintenance.sharedReload({
+              caller: { ...caller, issuedAt: 2 },
+              requestId,
+              phase: "begin",
+            }),
+          ))._tag,
+          "Failure",
+        );
+        assert.isTrue(
+          (yield* maintenance.sharedReload({ caller, requestId, phase: "begin" })).mayExecute,
+        );
+        assert.isFalse(
+          (yield* maintenance.sharedReload({ caller, requestId, phase: "begin" })).mayExecute,
+        );
+        assert.equal(
+          (yield* maintenance.sharedReload({
+            caller,
+            requestId,
+            phase: "finish",
+            outcome: "succeeded",
+          })).reservation.status,
+          "succeeded",
+        );
+        yield* orchestrator.dispatch({
+          type: "thread.model-selection.set",
+          commandId: CommandId.make("released-other-model"),
+          threadId: otherThreadId,
+          modelSelection,
+        });
+        const pendingRequestId = RuntimeRequestId.make("maintenance:other-runless-request");
+        const request = {
+          id: pendingRequestId,
+          nodeId: NodeId.make("maintenance:other-request-node"),
+          providerTurnId: null,
+          nativeRequestRef: null,
+          kind: "user_input" as const,
+          status: "pending" as const,
+          responseCapability: { type: "message" as const },
+          createdAt: now,
+          resolvedAt: null,
+        };
+        yield* projections.apply({
+          id: EventId.make("maintenance-other-pending"),
+          type: "runtime-request.updated",
+          threadId: otherThreadId,
+          occurredAt: now,
+          payload: request,
+        });
+        const refusedId = CommandId.make("reload:refused-runless-request");
+        assert.equal(
+          (yield* Effect.exit(
+            maintenance.sharedReload({ caller, requestId: refusedId, phase: "reserve" }),
+          ))._tag,
+          "Failure",
+        );
+        assert.equal(
+          (yield* projections.getThread(threadId)).providerMaintenance?.requestId,
+          requestId,
+        );
+        yield* projections.apply({
+          id: EventId.make("maintenance-other-resolved"),
+          type: "runtime-request.updated",
+          threadId: otherThreadId,
+          occurredAt: now,
+          payload: { ...request, status: "resolved", resolvedAt: now },
+        });
+        const expiresId = CommandId.make("reload:expire-before-begin");
+        yield* maintenance.sharedReload({ caller, requestId: expiresId, phase: "reserve" });
+        yield* TestClock.adjust("121 seconds");
+        const expired = yield* maintenance.sharedReload({
+          caller,
+          requestId: expiresId,
+          phase: "begin",
+        });
+        assert.equal(expired.reservation.status, "expired");
+        assert.isFalse(expired.mayExecute);
+        yield* orchestrator.dispatch({
+          type: "thread.model-selection.set",
+          commandId: CommandId.make("expired-other-model"),
+          threadId: otherThreadId,
+          modelSelection,
+        });
+        const unknownId = CommandId.make("reload:expire-after-begin");
+        yield* maintenance.sharedReload({ caller, requestId: unknownId, phase: "reserve" });
+        assert.isTrue(
+          (yield* maintenance.sharedReload({ caller, requestId: unknownId, phase: "begin" }))
+            .mayExecute,
+        );
+        assert.equal(
+          (yield* Effect.exit(
+            maintenance.sharedReload({ caller, requestId: unknownId, phase: "cancel" }),
+          ))._tag,
+          "Failure",
+        );
+        yield* Ref.set(slowProbe, true);
+        const finishing = yield* Effect.exit(
+          maintenance.sharedReload({
+            caller,
+            requestId: unknownId,
+            phase: "finish",
+            outcome: "succeeded",
+          }),
+        ).pipe(Effect.forkChild);
+        yield* Deferred.await(probeEntered);
+        yield* TestClock.adjust("121 seconds");
+        assert.equal((yield* Fiber.join(finishing))._tag, "Failure");
+        assert.equal(
+          (yield* maintenance.sharedReload({ caller, requestId: unknownId, phase: "status" }))
+            .reservation.status,
+          "unknown",
+        );
+        assert.equal(
+          (yield* Effect.exit(
+            maintenance.sharedReload({
+              caller,
+              requestId: unknownId,
+              phase: "finish",
+              outcome: "succeeded",
+            }),
+          ))._tag,
+          "Failure",
+        );
+        assert.equal(
+          (yield* Effect.exit(
+            orchestrator.dispatch({
+              type: "thread.model-selection.set",
+              commandId: CommandId.make("unknown-other-model"),
+              threadId: otherThreadId,
+              modelSelection,
+            }),
+          ))._tag,
+          "Failure",
+        );
+        assert.lengthOf((yield* projections.getThreadProjection(threadId)).runs, 0);
+        assert.lengthOf((yield* projections.getThreadProjection(threadId)).messages, 0);
+      }).pipe(Effect.provide(testLayer));
+    }),
+);
+
+it.effect("reserves a Pi restart once without a run and blocks new work and message answers", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const sql = yield* SqlClient.SqlClient;
+    const threadId = ThreadId.make("thread:pi-restart-controls");
+    const sessionId = ProviderSessionId.make("session:pi-restart-controls");
+    const providerThreadId = ProviderThreadId.make("provider-thread:pi-restart-controls");
+    const now = yield* DateTime.now;
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("create-pi-restart-controls"),
+      threadId,
+      projectId: ProjectId.make("project:pi-restart-controls"),
+      title: "Pi restart",
+      modelSelection: { instanceId: piInstanceId, model: "openai-codex/gpt-6.1-sol" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "user",
+      creationSource: "web",
+    });
+    yield* projections.apply({
+      id: EventId.make("pi-restart-session"),
+      type: "provider-session.attached",
+      threadId,
+      occurredAt: now,
+      payload: {
+        id: sessionId,
+        driver: piAdapter.driver,
+        providerInstanceId: piInstanceId,
+        status: "stopped",
+        cwd: "/repo",
+        model: "openai-codex/gpt-6.1-sol",
+        capabilities: CodexProviderCapabilitiesV2,
+        createdAt: now,
+        updatedAt: now,
+        lastError: null,
+      },
+    });
+    yield* projections.apply({
+      id: EventId.make("pi-restart-provider-thread"),
+      type: "provider-thread.updated",
+      threadId,
+      occurredAt: now,
+      payload: {
+        id: providerThreadId,
+        driver: piAdapter.driver,
+        providerInstanceId: piInstanceId,
+        providerSessionId: sessionId,
+        appThreadId: threadId,
+        ownerNodeId: null,
+        nativeThreadRef: {
+          driver: piAdapter.driver,
+          nativeId: "/repo/saved-pi-session.jsonl",
+          strength: "strong",
+        },
+        nativeConversationHeadRef: null,
+        status: "idle",
+        firstRunOrdinal: 1,
+        lastRunOrdinal: 1,
+        handoffIds: [],
+        forkedFrom: null,
+        createdAt: now,
+        updatedAt: now,
+      },
+    });
+    const thread = yield* projections.getThread(threadId);
+    yield* projections.apply({
+      id: EventId.make("pi-restart-active-thread"),
+      type: "thread.metadata-updated",
+      threadId,
+      occurredAt: now,
+      payload: { ...thread, activeProviderThreadId: providerThreadId },
+    });
+    const bounded = yield* projections.getThreadSnapshotWindow(threadId, {
+      rowLimit: 1,
+      userTurnLimit: 1,
+    });
+    const live = yield* projections.getThreadProjection(threadId);
+    for (const projection of [bounded.projection, live]) {
+      assert.deepEqual(
+        projection.providerThreads.map((thread) => thread.id),
+        [providerThreadId],
+      );
+      assert.deepEqual(
+        projection.providerSessions.map((session) => session.id),
+        [sessionId],
+      );
+      assert.equal(projection.providerSessions[0]?.status, "stopped");
+    }
+    const command = {
+      type: "provider-session.restart" as const,
+      commandId: CommandId.make("restart-pi-controls"),
+      threadId,
+      providerSessionId: sessionId,
+    };
+    yield* orchestrator.dispatch(command);
+    yield* orchestrator.dispatch(command);
+    const reserved = yield* projections.getThreadProjection(threadId);
+    assert.equal(reserved.thread.providerMaintenance?.status, "pending");
+    assert.equal(reserved.thread.providerMaintenance?.requestId, command.commandId);
+    assert.lengthOf(reserved.runs, 0);
+    assert.lengthOf(reserved.messages, 0);
+    const rows = yield* sql<{
+      count: number;
+    }>`SELECT COUNT(*) AS count FROM orchestration_v2_effect_outbox WHERE thread_id = ${threadId}`;
+    assert.equal(rows[0]?.count, 1);
+    assert.equal(
+      (yield* Effect.exit(
+        orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make("pi-reserved-send"),
+          threadId,
+          messageId: MessageId.make("pi-reserved-message"),
+          text: "Do not start",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+          createdBy: "user",
+          creationSource: "web",
+        }),
+      ))._tag,
+      "Failure",
+    );
+    assert.equal(
+      (yield* Effect.exit(
+        orchestrator.dispatch({
+          type: "queue.resume",
+          commandId: CommandId.make("pi-reserved-queue"),
+          threadId,
+        }),
+      ))._tag,
+      "Failure",
+    );
+    assert.equal(
+      (yield* Effect.exit(
+        orchestrator.dispatch({
+          type: "thread.model-selection.set",
+          commandId: CommandId.make("pi-reserved-model"),
+          threadId,
+          modelSelection: { instanceId: piInstanceId, model: "default" },
+        }),
+      ))._tag,
+      "Failure",
+    );
+    // A request arriving after reservation must not sneak a provider wake or new run through.
+    const requestId = RuntimeRequestId.make("pi-reserved-request");
+    yield* projections.apply({
+      id: EventId.make("pi-reserved-request-event"),
+      type: "runtime-request.updated",
+      threadId,
+      occurredAt: now,
+      payload: {
+        id: requestId,
+        nodeId: NodeId.make("pi-reserved-request-node"),
+        providerTurnId: null,
+        nativeRequestRef: null,
+        kind: "user_input",
+        status: "pending",
+        responseCapability: { type: "message" },
+        createdAt: now,
+        resolvedAt: null,
+      },
+    });
+    assert.equal(
+      (yield* Effect.exit(
+        orchestrator.dispatch({
+          type: "runtime-request.respond",
+          commandId: CommandId.make("pi-reserved-answer"),
+          threadId,
+          requestId,
+          answers: { question: "Do not wake" },
+        }),
+      ))._tag,
+      "Failure",
+    );
+    yield* orchestrator.dispatch({
+      type: "thread.visit",
+      commandId: CommandId.make("pi-reserved-visit"),
+      threadId,
+      visitedAt: DateTime.formatIso(now),
+    });
+    assert.lengthOf((yield* projections.getThreadProjection(threadId)).runs, 0);
+  }).pipe(Effect.provide(layerTest)),
 );
 
 it.effect(

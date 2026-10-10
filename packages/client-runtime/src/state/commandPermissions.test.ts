@@ -10,12 +10,16 @@ import {
   AuthOrchestrationOperateScope,
   AuthSourceControlWriteScope,
   ThreadId,
+  CommandId,
+  ProviderSessionId,
+  ORCHESTRATION_V2_WS_METHODS,
   EnvironmentId,
   ScheduledTaskId,
   WS_METHODS,
   type AuthSessionState,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -24,6 +28,7 @@ import { Atom, AtomRegistry, AsyncResult } from "effect/reactivity";
 import { EnvironmentRegistry } from "../connection/registry.ts";
 import { createCommandPermissions } from "./commandPermissions.ts";
 import { createEnvironmentRpcCommand } from "./runtime.ts";
+import { createThreadEnvironmentAtoms } from "./threadCommands.ts";
 
 vi.mock("./session.ts", () => ({
   createEnvironmentSessionAtoms: () => ({ sessionStateAtom: sessions }),
@@ -58,6 +63,74 @@ const setup = Effect.gen(function* () {
 });
 
 describe("command permissions", () => {
+  it.effect("uses the destination orchestration grant for explicit Pi RPC restart", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const registry = yield* setup;
+        let writes = 0;
+        const supervisor = {
+          target: { environmentId: env },
+          session: yield* SubscriptionRef.make(
+            Option.some({
+              client: {
+                [ORCHESTRATION_V2_WS_METHODS.restartPiRpc]: () =>
+                  Effect.sync(() => {
+                    writes++;
+                    return { sequence: writes };
+                  }),
+              },
+            } as unknown as RpcSession),
+          ),
+        } as unknown as EnvironmentSupervisor["Service"];
+        const restartRuntime = Atom.runtime(
+          Layer.mergeAll(
+            Layer.succeed(EnvironmentRegistry, {
+              run: (_id, effect) =>
+                Effect.provideService(effect, EnvironmentSupervisor, supervisor),
+            } as EnvironmentRegistry["Service"]),
+            Layer.succeed(
+              Crypto.Crypto,
+              Crypto.make({
+                randomBytes: (size) => new Uint8Array(size),
+                digest: (_algorithm, data) => Effect.succeed(data),
+              }),
+            ),
+          ),
+        );
+        const command = createThreadEnvironmentAtoms(restartRuntime, () =>
+          Atom.make(null),
+        ).restartPiRpc;
+        const input = {
+          type: "provider-session.restart" as const,
+          commandId: CommandId.make("confirmed-restart"),
+          threadId: ThreadId.make("saved-thread"),
+          providerSessionId: ProviderSessionId.make("saved-pi-session"),
+        };
+        registry.set(sessions(env), AsyncResult.success(grant(true)));
+        registry.set(sessions(other), AsyncResult.success(grant(false)));
+        expect(registry.get(command.permissionAtom(env))).toBe(true);
+        expect(registry.get(command.permissionAtom(other))).toBe(false);
+        const denied = yield* Effect.promise(() =>
+          command.run(registry, { environmentId: other, input }),
+        );
+        expect(denied._tag).toBe("Failure");
+        expect(writes).toBe(0);
+        const allowed = yield* Effect.promise(() =>
+          command.run(registry, { environmentId: env, input }),
+        );
+        expect(allowed._tag).toBe("Success");
+        expect(writes).toBe(1);
+        registry.set(sessions(env), AsyncResult.success(grant(false)));
+        expect(registry.get(command.permissionAtom(env))).toBe(false);
+        const revoked = yield* Effect.promise(() =>
+          command.run(registry, { environmentId: env, input }),
+        );
+        expect(revoked._tag).toBe("Failure");
+        expect(writes).toBe(1);
+      }),
+    ),
+  );
+
   it.effect("uses the target grant for both availability and execution", () =>
     Effect.scoped(
       Effect.gen(function* () {

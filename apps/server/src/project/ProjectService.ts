@@ -29,6 +29,11 @@ import {
 } from "../orchestration-v2/ProjectCommands.ts";
 import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import * as ThreadCommandExecutor from "../orchestration-v2/ThreadCommandExecutor.ts";
+import * as MaintenanceAdmission from "../orchestration-v2/ProviderMaintenanceAdmission.ts";
+
+const isMaintenanceAdmissionError = Schema.is(
+  MaintenanceAdmission.ProviderMaintenanceAdmissionError,
+);
 import { planThreadDeletion } from "../orchestration-v2/ThreadDeletion.ts";
 import * as ProjectEnrichmentService from "./ProjectEnrichmentService.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
@@ -153,6 +158,7 @@ export const make = Effect.gen(function* () {
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
   const legacyImporter = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
   const threadCommands = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+  const admission = yield* MaintenanceAdmission.ProviderMaintenanceAdmission;
   // Commands for one project run in order. Commands that claim a workspace root
   // also hold that root, so two projects cannot both claim it.
   const projectLocks = yield* KeyedLock.make<ProjectId>();
@@ -558,7 +564,18 @@ export const make = Effect.gen(function* () {
     create,
     bootstrap,
     update,
-    delete: deleteProject,
+    delete: (input) =>
+      admission.withAdmission({}, deleteProject(input)).pipe(
+        Effect.mapError((cause) =>
+          isMaintenanceAdmissionError(cause)
+            ? new ProjectOperationError({
+                operation: "dispatch-project-command",
+                projectId: input.projectId,
+                cause,
+              })
+            : cause,
+        ),
+      ),
     getById,
     getByWorkspaceRoot,
     snapshot,
@@ -569,4 +586,5 @@ export const make = Effect.gen(function* () {
 
 export const layer = Layer.effect(ProjectService, make).pipe(
   Layer.provide(ThreadCommandExecutor.layer),
+  Layer.provide(MaintenanceAdmission.layer),
 );

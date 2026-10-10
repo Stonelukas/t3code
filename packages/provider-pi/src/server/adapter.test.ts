@@ -19,13 +19,16 @@ import {
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as PlatformError from "effect/PlatformError";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -149,6 +152,8 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
   let vetoNewSession = false;
   let deferredLifecycle: string | undefined;
   let sessionFile = FAKE_SESSION_FILE;
+  let selectedModel: unknown = undefined;
+  let thinkingLevel = "high";
   let sessionGeneration = 0;
   let models: ReadonlyArray<unknown> = [];
   let stdinBuffer = "";
@@ -174,7 +179,21 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
         }
         // Queued data overrides fields of the recorded idle state, so a test
         // that only cares about the session file still gets a real shape.
-        return { ...base, data: { ...recordedIdleState(sessionFile), ...stateQueue.shift() } };
+        return {
+          ...base,
+          data: {
+            ...recordedIdleState(sessionFile),
+            model: selectedModel,
+            thinkingLevel,
+            ...stateQueue.shift(),
+          },
+        };
+      case "set_model":
+        selectedModel = { provider: record.provider, id: record.modelId };
+        return { ...base, data: selectedModel };
+      case "set_thinking_level":
+        thinkingLevel = String(record.level);
+        return base;
       case "get_available_models":
         return { ...base, data: { models } };
       case "new_session": {
@@ -186,6 +205,7 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
       case "switch_session": {
         const cancelled = vetoSwitch;
         vetoSwitch = false;
+        if (!cancelled) sessionFile = String(record.sessionPath);
         return { ...base, data: { cancelled } };
       }
       case "get_entries":
@@ -377,7 +397,7 @@ const openRuntime = Effect.fnUntraced(function* (
         if (predicate(event)) return event;
       }
     });
-  return { runtime, takeEvent };
+  return { runtime, takeEvent, emitted };
 });
 
 const makeAppThread = Effect.fnUntraced(function* (model: string, threadId = THREAD_ID) {
@@ -1383,6 +1403,213 @@ describe("PiAdapterV2", () => {
       );
       yield* startTurn(runtime, replacement, "default");
       yield* fake.takeRequest("prompt");
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect(
+    "binds maintenance to its request and captures inherited native selection without prompting",
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        fake.queueState({
+          model: { provider: "anthropic", id: "native-model" },
+          thinkingLevel: "medium",
+        });
+        const selection = yield* runtime.enterMaintenance!({ requestId: "maintenance-1" });
+        assert.deepEqual(selection, {
+          instanceId: PI_INSTANCE_ID,
+          model: "anthropic/native-model",
+          options: [{ id: "thinking", value: "medium" }],
+        });
+        yield* startTurn(runtime, providerThread, "default").pipe(Effect.flip);
+        yield* runtime.exitMaintenance!({ requestId: "other" }).pipe(Effect.flip);
+        fake.queueState({
+          model: { provider: "anthropic", id: "native-model" },
+          thinkingLevel: "medium",
+        });
+        yield* runtime.exitMaintenance!({ requestId: "maintenance-1" });
+        assert.isFalse(fake.allRequests().some((request) => request.type === "prompt"));
+        yield* startTurn(runtime, providerThread, "default");
+        yield* fake.takeRequest("prompt");
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each([
+    { isStreaming: true },
+    { isCompacting: true },
+    { pendingMessageCount: 1 },
+    { model: undefined },
+  ])("refuses maintenance when native state is busy or selection is unknown: %j", (state) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime } = yield* openRuntime(fake);
+      yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      fake.queueState({ model: { provider: "anthropic", id: "native-model" }, ...state });
+      yield* runtime.enterMaintenance!({ requestId: "maintenance-1" }).pipe(Effect.flip);
+      assert.isFalse(fake.allRequests().some((request) => request.type === "prompt"));
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect(
+    "detects native activity racing maintenance setup before the event permit is available",
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime } = yield* openRuntime(fake);
+        yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        fake.deferNextState();
+        const requests = fake.allRequests().filter((r) => r.type === "get_state").length;
+        const entering = yield* runtime.enterMaintenance!({ requestId: "maintenance-1" }).pipe(
+          Effect.exit,
+          Effect.forkChild,
+        );
+        // Drain prior state requests, then rendezvous on the held probe.
+        for (let i = 0; i <= requests; i++) yield* fake.takeRequest("get_state");
+        yield* fake.emit({ type: "agent_start" });
+        yield* fake.resolveDeferredState({
+          ...recordedIdleState(FAKE_SESSION_FILE),
+          model: { provider: "anthropic", id: "native-model" },
+        });
+        assert.isTrue(Exit.isFailure(yield* Fiber.join(entering)));
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("keeps a maintenance barrier invalidated by native wake activity", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      fake.queueState({ model: { provider: "anthropic", id: "native-model" } });
+      yield* runtime.enterMaintenance!({ requestId: "maintenance-1" });
+      yield* fake.emit({ type: "agent_start" });
+      yield* takeEvent(
+        (event) =>
+          event.type === "provider_session.updated" && event.providerSession.status === "running",
+      );
+      fake.queueState({ model: { provider: "anthropic", id: "native-model" } });
+      yield* runtime.exitMaintenance!({ requestId: "maintenance-1" }).pipe(Effect.flip);
+      yield* startTurn(runtime, providerThread, "default").pipe(Effect.flip);
+      assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+      assert.isFalse(
+        fake
+          .allRequests()
+          .some((request) => request.type === "prompt" || request.type === "extension_ui_response"),
+      );
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("restores a resume selection without prompting", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      const resumed = yield* runtime.resumeThread({
+        providerThread,
+        modelSelection: {
+          ...modelSelection("anthropic/selected"),
+          options: [{ id: "thinking", value: "medium" }],
+        },
+      });
+      assert.equal(resumed.nativeThreadRef?.nativeId, FAKE_SESSION_FILE);
+      assert.equal(runtime.providerSession.model, "anthropic/selected");
+      assert.isTrue(
+        fake
+          .allRequests()
+          .some((request) => request.type === "set_model" && request.modelId === "selected"),
+      );
+      assert.isTrue(
+        fake
+          .allRequests()
+          .some((request) => request.type === "set_thinking_level" && request.level === "medium"),
+      );
+      assert.isFalse(
+        fake
+          .allRequests()
+          .some((request) => request.type === "prompt" || request.type === "new_session"),
+      );
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each([
+    "missing ref",
+    "wrong switch file",
+    "wrong state file",
+    "wrong model",
+    "wrong thinking",
+  ] as const)("rejects explicit resume with %s without prompting or replacing it", (failure) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent, emitted } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* takeEvent((event) => event.type === "provider_thread.updated");
+      const publishedBefore = fake.allRequests().length;
+      if (failure === "wrong state file") fake.queueState({ sessionFile: "/fake/wrong.jsonl" });
+      if (failure === "wrong model" || failure === "wrong thinking") {
+        fake.queueState({});
+        fake.queueState(
+          failure === "wrong model"
+            ? { model: { provider: "other", id: "model" } }
+            : { thinkingLevel: "low" },
+        );
+      }
+      if (failure === "wrong switch file") fake.deferNextLifecycle("switch_session");
+      const result = yield* runtime
+        .resumeThread({
+          providerThread:
+            failure === "missing ref"
+              ? { ...providerThread, nativeThreadRef: null }
+              : providerThread,
+          modelSelection: {
+            ...modelSelection("anthropic/selected"),
+            options: [{ id: "thinking", value: "medium" }],
+          },
+        })
+        .pipe(Effect.exit, Effect.forkChild);
+      if (failure === "wrong switch file") {
+        const request = yield* fake.takeRequest("switch_session");
+        yield* fake.emit({
+          type: "response",
+          id: request.id,
+          command: "switch_session",
+          success: true,
+          data: { cancelled: false, sessionFile: "/fake/wrong.jsonl" },
+        });
+      }
+      assert.isTrue(Exit.isFailure(yield* Fiber.join(result)));
+      yield* Effect.yieldNow;
+      assert.equal((yield* Queue.poll(emitted))._tag, "None");
+      assert.isFalse(
+        fake
+          .allRequests()
+          .slice(publishedBefore)
+          .some((request) => request.type === "new_session" || request.type === "prompt"),
+      );
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
@@ -3610,7 +3837,7 @@ describe("PiRpc framing", () => {
 // an honest fit. The boundary is the stdio transport seeing stdout end.
 describe("PiRpc early process exit", () => {
   const makeHandle = (options: {
-    readonly exitCode: Effect.Effect<ChildProcessSpawner.ExitCode>;
+    readonly exitCode: Effect.Effect<ChildProcessSpawner.ExitCode, PlatformError.PlatformError>;
     readonly stderr: Stream.Stream<Uint8Array>;
   }) =>
     ChildProcessSpawner.makeHandle({
@@ -3626,6 +3853,73 @@ describe("PiRpc early process exit", () => {
       getInputFd: () => Sink.drain,
       getOutputFd: () => Stream.empty,
     });
+
+  it.effect("requires observed child exit even after termination and scope close finish", () =>
+    Effect.gen(function* () {
+      const processScope = yield* Scope.make();
+      const exit = yield* Deferred.make<ChildProcessSpawner.ExitCode>();
+      const observing = yield* Queue.unbounded<void>();
+      const confirmed = yield* Deferred.make<void>();
+      const spawner = ChildProcessSpawner.make(() =>
+        Effect.succeed(
+          makeHandle({
+            exitCode: Queue.offer(observing, undefined).pipe(Effect.andThen(Deferred.await(exit))),
+            stderr: Stream.empty,
+          }),
+        ),
+      );
+      const connection = yield* makePiRpcConnection({
+        command: "pi",
+        args: ["--mode", "rpc"],
+        cwd: undefined,
+        env: {},
+      }).pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        Effect.provideService(Scope.Scope, processScope),
+      );
+      yield* Queue.take(observing);
+      yield* connection.terminate;
+      yield* Scope.close(processScope, Exit.void);
+      const waiting = yield* connection.confirmShutdown.pipe(
+        Effect.andThen(Deferred.succeed(confirmed, undefined)),
+        Effect.forkChild,
+      );
+      yield* Queue.take(observing);
+      assert.isTrue((yield* Deferred.poll(confirmed))._tag === "None");
+      yield* Deferred.succeed(exit, ChildProcessSpawner.ExitCode(137));
+      yield* Fiber.join(waiting);
+      assert.isTrue((yield* Deferred.poll(confirmed))._tag === "Some");
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect.each([true, false])(
+    "only recognizes the spawner's observed signal-exit error, observed=%s",
+    (observed) =>
+      Effect.gen(function* () {
+        const error = new PlatformError.PlatformError(
+          new PlatformError.SystemError({
+            _tag: "Unknown",
+            module: "ChildProcess",
+            method: "exitCode",
+            cause: new Error(
+              observed
+                ? "Process interrupted due to receipt of signal: 'SIGKILL'"
+                : "exit wait failed",
+            ),
+          }),
+        );
+        const spawner = ChildProcessSpawner.make(() =>
+          Effect.succeed(makeHandle({ exitCode: Effect.fail(error), stderr: Stream.empty })),
+        );
+        const connection = yield* makePiRpcConnection({
+          command: "pi",
+          args: ["--mode", "rpc"],
+          cwd: undefined,
+          env: {},
+        }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
+        assert.equal(Exit.isSuccess(yield* Effect.exit(connection.confirmShutdown)), observed);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
 
   it.effect("reports a nonzero exit code instead of an unexplained stdout close", () =>
     Effect.gen(function* () {
