@@ -203,7 +203,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
       >
         <ComposerBanner.Icon />
         <ComposerBanner.Content>
-          <span className="shrink-0 font-medium text-muted-foreground">
+          <span className="min-w-0 truncate font-medium text-muted-foreground">
             {activeQuestion.header}
           </span>
           {isCollapsed ? (
@@ -246,7 +246,9 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
       <CollapsiblePanel>
         <ComposerBanner.Scroll>
           <ComposerBanner.Body className="pe-1 pb-1 wrap-anywhere">
-            <p className="text-sm text-foreground/85">{activeQuestion.question}</p>
+            <p className="whitespace-pre-wrap text-sm leading-relaxed text-foreground/85">
+              {activeQuestion.question}
+            </p>
             {activeQuestion.multiSelect ? (
               <p className="mt-1 text-secondary-label text-xs">Select one or more options.</p>
             ) : null}
@@ -271,9 +273,13 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
                 const content = (
                   <>
                     <div className="min-w-0 flex-1 flex flex-col gap-0.5">
-                      <span className="text-sm font-medium">{option.label}</span>
+                      <span className="whitespace-pre-wrap text-sm font-medium">
+                        {option.label}
+                      </span>
                       {option.description && option.description !== option.label ? (
-                        <span className="text-secondary-label text-2xs">{option.description}</span>
+                        <span className="whitespace-pre-wrap text-secondary-label text-2xs">
+                          {option.description}
+                        </span>
                       ) : null}
                     </div>
                     {isSelected ? (

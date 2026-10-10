@@ -2607,6 +2607,86 @@ describe("PiAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
+  it.effect(
+    "keeps the complete select prompt out of the header and preserves choice identities",
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        const title = `Which approach should we use?\n\nContext:\n${"Detailed context\n".repeat(500)}`;
+        const choices = ["  Incremental\nkeep existing behavior  ", "Replace everything"];
+        yield* fake.emit({
+          type: "extension_ui_request",
+          id: "ui-select-context",
+          method: "select",
+          title,
+          options: choices,
+        });
+        const event = yield* takeEvent(
+          (event) =>
+            event.type === "turn_item.updated" && event.turnItem.type === "user_input_request",
+        );
+        if (event.type !== "turn_item.updated" || event.turnItem.type !== "user_input_request")
+          return;
+        const question = event.turnItem.questions[0];
+        assert.equal(question?.header, "Choose an option");
+        assert.equal(question?.question, title);
+        assert.deepEqual(
+          question?.options.map((option) => option.value),
+          choices,
+        );
+        yield* runtime.respondToRuntimeRequest({
+          requestId: event.turnItem.requestId,
+          answers: { "ui-select-context": choices[0] },
+        });
+        const response = yield* fake.takeRequest("extension_ui_response");
+        assert.equal(response["id"], "ui-select-context");
+        assert.equal(response["value"], choices[0]);
+        assert.isUndefined(response["cancelled"]);
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("keeps input context visible when Pi supplies a placeholder", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      const title =
+        "What should change?\n\nContext:\nKeep the current environment and conversation.";
+      yield* fake.emit({
+        type: "extension_ui_request",
+        id: "ui-input-context",
+        method: "input",
+        title,
+        placeholder: "Describe the change",
+      });
+      const event = yield* takeEvent(
+        (event) =>
+          event.type === "turn_item.updated" && event.turnItem.type === "user_input_request",
+      );
+      if (event.type !== "turn_item.updated" || event.turnItem.type !== "user_input_request")
+        return;
+      assert.equal(event.turnItem.questions[0]?.header, "Enter a response");
+      assert.equal(event.turnItem.questions[0]?.question, `${title}\n\nDescribe the change`);
+      const answer = "  preserve this answer\nexactly  ";
+      yield* runtime.respondToRuntimeRequest({
+        requestId: event.turnItem.requestId,
+        answers: { "ui-input-context": answer },
+      });
+      const response = yield* fake.takeRequest("extension_ui_response");
+      assert.equal(response["value"], answer);
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
   it.effect("offers an explicit empty value for extension input dialogs", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakePi;

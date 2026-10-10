@@ -3229,10 +3229,23 @@ function piQuestion(
               value: "",
             },
           ];
-  const question = recordString(event, "message") ?? recordString(event, "placeholder") ?? title;
+  // Pi's title is the complete dialog prompt, not a short section heading.
+  // Keep it in the scrollable body once, including any multiline context.
+  const header =
+    method === "select"
+      ? "Choose an option"
+      : method === "editor"
+        ? "Edit response"
+        : "Enter a response";
+  const prompt = recordString(event, "message") ?? title;
+  const placeholder = recordString(event, "placeholder");
+  const question =
+    method === "input" && placeholder && placeholder !== prompt
+      ? `${prompt}\n\n${placeholder}`
+      : prompt || header;
   return {
     id: questionId,
-    header: title,
+    header,
     question,
     ...(method === "editor" ? { initialAnswer: recordString(event, "prefill") ?? "" } : {}),
     options,
