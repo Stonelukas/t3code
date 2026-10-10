@@ -21,6 +21,31 @@ import * as DesktopUpdates from "./DesktopUpdates.ts";
 import { flushCallbacks, makeHarness } from "./updatesTestHarness.ts";
 
 describe("DesktopUpdates", () => {
+  it.effect("refuses automatic and manual updates of the owner-managed fork", () => {
+    const harness = makeHarness({ appVersion: "0.0.46-nightly.20261009.2886.stonelukas.1" });
+    return Effect.scoped(
+      Effect.gen(function* () {
+        const updates = yield* DesktopUpdates.DesktopUpdates;
+        yield* updates.configure;
+        assert.equal((yield* updates.getState).enabled, false);
+        assert.equal((yield* updates.getState).status, "disabled");
+        assert.include(Option.getOrThrow(yield* updates.disabledReason), "owner-managed");
+        assert.deepEqual(harness.feedUrls(), []);
+        assert.equal(harness.listenerCount(), 0);
+        yield* TestClock.adjust(Duration.minutes(5));
+        assert.equal(harness.checkCount(), 0);
+        assert.equal((yield* updates.check("manual")).checked, false);
+        assert.equal((yield* updates.download).accepted, false);
+        assert.equal((yield* updates.install).accepted, false);
+        assert.equal((yield* updates.installPrepared("9.0.0")).accepted, false);
+        assert.equal((yield* updates.setChannel("latest")).enabled, false);
+        assert.equal(harness.checkCount(), 0);
+        assert.equal(harness.downloadCount(), 0);
+        assert.equal(harness.quitAndInstalls(), 0);
+      }),
+    ).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+  });
+
   it("preserves complete causes for update poller and event failures", () => {
     const cause = Cause.combine(
       Cause.fail(new Error("updater failed")),

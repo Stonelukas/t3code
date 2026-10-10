@@ -22,6 +22,10 @@ import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
+import {
+  isOwnerManagedForkVersion,
+  OWNER_MANAGED_FORK_UPDATE_REASON,
+} from "@t3tools/shared/cliRelease";
 
 import * as DesktopBackendPool from "../backend/DesktopBackendPool.ts";
 import * as DesktopConfig from "../app/DesktopConfig.ts";
@@ -350,6 +354,9 @@ export const make = Effect.gen(function* () {
   );
 
   const resolveDisabledReason = Effect.gen(function* () {
+    if (isOwnerManagedForkVersion(environment.appVersion)) {
+      return Option.some(OWNER_MANAGED_FORK_UPDATE_REASON);
+    }
     const hasFeedConfig = yield* hasUpdateFeedConfig;
     return Option.fromNullishOr(
       getAutoUpdateDisabledReason({
@@ -907,6 +914,13 @@ export const make = Effect.gen(function* () {
     emitState,
     disabledReason: resolveDisabledReason,
     configure: Effect.gen(function* () {
+      if (isOwnerManagedForkVersion(environment.appVersion)) {
+        yield* electronUpdater.setAutoDownload(false);
+        yield* electronUpdater.setAutoInstallOnAppQuit(false);
+        const settings = yield* desktopSettings.get;
+        yield* setState(createBaseUpdateState(settings.updateChannel, false, environment));
+        return;
+      }
       const context = yield* Effect.context<never>();
       const runEffect = (effect: Effect.Effect<void>) => {
         void Effect.runPromiseWith(context)(effect);

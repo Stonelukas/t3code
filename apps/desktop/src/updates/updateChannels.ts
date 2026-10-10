@@ -1,4 +1,5 @@
 import type { DesktopUpdateChannel } from "@t3tools/contracts";
+import { isOwnerManagedForkVersion } from "@t3tools/shared/cliRelease";
 
 const NIGHTLY_VERSION_PATTERN = /^[^-+]+-nightly\.\d{8}\.\d+$/;
 // Preview builds are the maintainers' test train, cut by hand from unreleased
@@ -10,9 +11,11 @@ const NIGHTLY_VERSION_PATTERN = /^[^-+]+-nightly\.\d{8}\.\d+$/;
 const PRERELEASE_VERSION_PATTERN = /^[^-+]+-(?:nightly|preview)\.\d{8}\.\d+$/;
 
 export function isNightlyDesktopVersion(version: string): boolean {
-  return PRERELEASE_VERSION_PATTERN.test(version);
+  return PRERELEASE_VERSION_PATTERN.test(version) || isOwnerManagedForkVersion(version);
 }
 
 export function resolveDefaultDesktopUpdateChannel(appVersion: string): DesktopUpdateChannel {
-  return NIGHTLY_VERSION_PATTERN.test(appVersion) ? "nightly" : "latest";
+  return NIGHTLY_VERSION_PATTERN.test(appVersion) || isOwnerManagedForkVersion(appVersion)
+    ? "nightly"
+    : "latest";
 }

@@ -261,6 +261,10 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
   it("resolves the dedicated nightly updater channel from nightly versions", () => {
     assert.equal(resolveDesktopUpdateChannel("0.0.17-nightly.20260413.42"), "nightly");
     assert.equal(resolveDesktopUpdateChannel("0.0.17"), "latest");
+    assert.equal(
+      resolveDesktopUpdateChannel("0.0.46-nightly.20261009.2886.stonelukas.1"),
+      "nightly",
+    );
   });
 
   it("switches desktop packaging product names to nightly for nightly builds", () => {
@@ -328,7 +332,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     }),
   );
 
-  it.effect("omits update feeds for pull request preview builds", () =>
+  it.effect("omits update feeds for pull request preview and owner-managed fork builds", () =>
     Effect.gen(function* () {
       const preview = yield* createBuildConfig(
         "mac",
@@ -359,6 +363,16 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         undefined,
       );
 
+      const fork = yield* createBuildConfig(
+        "linux",
+        "AppImage",
+        "0.0.46-nightly.20261009.2886.stonelukas.1",
+        false,
+        true,
+        4141,
+        undefined,
+      );
+      assert.notProperty(fork, "publish");
       assert.notProperty(preview, "publish");
       assert.notProperty(previewChannel, "publish");
       assert.deepStrictEqual(release.publish, [
