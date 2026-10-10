@@ -29,7 +29,6 @@ import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EffectWorker from "./EffectWorker.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
-import * as ProviderMaintenanceService from "./ProviderMaintenanceService.ts";
 import * as ProviderMaintenanceAdmission from "./ProviderMaintenanceAdmission.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
 import * as ProviderTurnStartService from "./ProviderTurnStartService.ts";
@@ -93,9 +92,6 @@ function layerExecutorFor(input: {
 }) {
   const record = (event: string) => Ref.update(input.events, (events) => [...events, event]);
   const layerDependencies = Layer.mergeAll(
-    Layer.mock(ProviderMaintenanceService.ProviderMaintenanceService)({
-      execute: () => Effect.die("unused Pi session restart"),
-    }),
     Layer.succeed(
       ProviderTurnControlService.ProviderTurnControlServiceV2,
       ProviderTurnControlService.ProviderTurnControlServiceV2.of({
@@ -289,8 +285,6 @@ it.effect("only the pending Suite reload requesting capture can drain the enviro
         { ...maintenance, status: "unknown" as const },
         { ...maintenance, status: "expired" as const },
         { ...maintenance, deadlineEpochMs: DateTime.toEpochMillis(now) },
-        { ...maintenance, kind: "pi-rpc-restart" as const },
-        { ...maintenance, scope: "thread" as const },
         { ...maintenance, requestId: CommandId.make("different-owner") },
       ]) {
         yield* Ref.set(persisted, mismatch);
@@ -799,67 +793,6 @@ it.effect("keeps a max-attempt replay-safe failure terminal when fail settlement
 
     assert.isTrue(Exit.isFailure(exit));
     assert.equal(yield* Ref.get(failAttempts), 2);
-    assert.equal(yield* Ref.get(retries), 0);
-  }),
-);
-
-it.effect("does not retry an explicit Pi restart failure, even on its first attempt", () =>
-  Effect.gen(function* () {
-    const now = DateTime.formatIso(yield* DateTime.now);
-    const effectId = "effect:explicit-pi-restart";
-    const workerId = "worker:explicit-pi-restart";
-    const requestId = CommandId.make("command:explicit-pi-restart");
-    const claimed: EffectOutbox.OrchestrationEffectV2 = {
-      id: effectId,
-      commandId: requestId,
-      threadId,
-      request: { type: "provider-session.restart", requestId },
-      status: "running",
-      attemptCount: 1,
-      availableAt: now,
-      leaseOwner: workerId,
-      leaseExpiresAt: now,
-      createdAt: now,
-      updatedAt: now,
-      completedAt: null,
-      lastError: null,
-    };
-    const retries = yield* Ref.make(0);
-    const failed = yield* Ref.make(0);
-    const executed = yield* Ref.make<ReadonlyArray<boolean>>([]);
-    const outbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
-      claimNext: () => Effect.succeed(Option.some(claimed)),
-      get: () => Effect.succeed(Option.some(claimed)),
-      awaitCancellation: () => Effect.never,
-      clearCancellation: () => Effect.void,
-      fail: () => Ref.update(failed, (count) => count + 1).pipe(Effect.as(true)),
-      retry: () => Ref.update(retries, (count) => count + 1).pipe(Effect.as(true)),
-    });
-    const executor = Layer.succeed(EffectWorker.OrchestrationEffectExecutorV2, {
-      execute: (_effect, options) =>
-        Ref.update(executed, (values) => [...values, options?.willRetry ?? true]).pipe(
-          Effect.andThen(
-            Effect.fail(
-              new EffectWorker.OrchestrationEffectExecutionError({
-                effectId,
-                effectType: claimed.request.type,
-                cause: "unconfirmed shutdown",
-              }),
-            ),
-          ),
-        ),
-    });
-    const worker = EffectWorker.layerWithOptions({ workerId, maxAttempts: 5 }).pipe(
-      Layer.provide(Layer.merge(outbox, executor)),
-    );
-    assert.isTrue(
-      yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
-        Effect.flatMap((service) => service.runOnce),
-        Effect.provide(worker),
-      ),
-    );
-    assert.deepEqual(yield* Ref.get(executed), [false]);
-    assert.equal(yield* Ref.get(failed), 1);
     assert.equal(yield* Ref.get(retries), 0);
   }),
 );

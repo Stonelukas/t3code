@@ -257,8 +257,8 @@ export const make = Effect.gen(function* () {
           ),
         );
       const events: Array<OrchestrationV2DomainEvent> = [];
-      const restart = projection.thread.providerMaintenance;
-      if (restart !== undefined && ["pending", "running"].includes(restart.status)) {
+      const maintenance = projection.thread.providerMaintenance;
+      if (maintenance !== undefined && ["pending", "running"].includes(maintenance.status)) {
         events.push({
           id: yield* allocateEventId(),
           type: "thread.metadata-updated",
@@ -269,10 +269,10 @@ export const make = Effect.gen(function* () {
             ...projection.thread,
             updatedAt: now,
             providerMaintenance: {
-              ...restart,
+              ...maintenance,
               status: "unknown",
               message:
-                "The server stopped before Pi RPC restart was confirmed. It was not replayed. Check the provider and server logs before an explicit retry.",
+                "The server stopped before shared Suite reload was acknowledged. It was not replayed. Check the provider and server logs before an explicit retry.",
             },
           },
         });

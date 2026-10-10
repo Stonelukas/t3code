@@ -163,7 +163,6 @@ export interface ProviderSessionManagerV2Shape {
     readonly resumeFromSession?: OrchestrationV2ProviderSession;
     readonly initialNativeThreadId?: string;
     readonly initialProviderItemIdentityVersion?: 2;
-    readonly maintenanceRequestId?: string;
   }) => Effect.Effect<
     ProviderAdapter.ProviderAdapterV2SessionRuntime,
     ProviderSessionManagerV2Error
@@ -185,7 +184,6 @@ export interface ProviderSessionManagerV2Shape {
     readonly providerSessionId: ProviderSessionId;
     readonly reason: ProviderSessionReleaseReason;
     readonly detail?: string;
-    readonly requireConfirmedShutdown?: boolean;
   }) => Effect.Effect<void, ProviderSessionManagerV2Error>;
   readonly detach: (input: {
     readonly providerSessionId: ProviderSessionId;
@@ -430,10 +428,6 @@ export const layerWithOptions = (
       const releaseRecordRetries = yield* FiberSet.make();
       const nextSubscriberId = yield* Ref.make(0);
       const sessionOpen = yield* KeyedLock.make<ProviderSessionId>();
-      // A strict shutdown reserves the id before removing its live entry. An
-      // uncertain/failed close retains the reservation rather than permitting
-      // a second process to open against the same native session.
-      const unconfirmedShutdowns = new Set<ProviderSessionId>();
       // Orders a thread's attach against a detach unloading it on the same session.
       const threadAttachment = yield* KeyedLock.make<string>();
       const threadAttachmentKey = (input: {
@@ -947,35 +941,12 @@ export const layerWithOptions = (
         readonly providerSessionId: ProviderSessionId;
         readonly reason: ProviderSessionReleaseReason;
         readonly detail?: string;
-        readonly requireConfirmedShutdown?: boolean;
         readonly cancelIdleFiber?: boolean;
         readonly onlyIfIdleGeneration?: number;
         readonly gracefulSubscribers?: boolean;
       }) =>
         Effect.acquireUseRelease(
-          input.requireConfirmedShutdown === true
-            ? sessionOpen.withLock(
-                input.providerSessionId,
-                Effect.gen(function* () {
-                  if (unconfirmedShutdowns.has(input.providerSessionId)) {
-                    return yield* Effect.fail("Provider session shutdown is not confirmed");
-                  }
-                  const entry = (yield* Ref.get(sessions)).get(sessionKey(input.providerSessionId));
-                  if (entry !== undefined) {
-                    const pendingWork = yield* (
-                      entry.runtime.hasPendingBackgroundWork ?? Effect.succeed(false)
-                    );
-                    if (entry.busyTurns.size > 0 || pendingWork) {
-                      return yield* Effect.fail(
-                        "Provider session still has active or pending work",
-                      );
-                    }
-                    unconfirmedShutdowns.add(input.providerSessionId);
-                  }
-                  return yield* removeLiveEntry(input);
-                }),
-              )
-            : removeLiveEntry(input),
+          removeLiveEntry(input),
           ([entry, releasedAt]) =>
             Option.match(entry, {
               onNone: () => Effect.void,
@@ -1013,22 +984,6 @@ export const layerWithOptions = (
                   }
                   if (Option.isSome(closeExit) && Exit.isFailure(closeExit.value)) {
                     return yield* Effect.failCause(closeExit.value.cause);
-                  }
-                  if (input.requireConfirmedShutdown === true && Option.isNone(closeExit)) {
-                    return yield* Effect.fail(
-                      "Provider session shutdown timed out and remains unconfirmed",
-                    );
-                  }
-                  if (input.requireConfirmedShutdown === true) {
-                    if (entry.runtime.confirmShutdown === undefined) {
-                      return yield* Effect.fail("Provider has no owned-process exit confirmation");
-                    }
-                    const confirmed = yield* entry.runtime.confirmShutdown.pipe(
-                      Effect.timeoutOption(RELEASE_SCOPE_CLOSE_TIMEOUT_MS),
-                    );
-                    if (Option.isNone(confirmed)) {
-                      return yield* Effect.fail("Provider process exit remains unconfirmed");
-                    }
                   }
                 }).pipe(
                   withMetrics({
@@ -1081,16 +1036,6 @@ export const layerWithOptions = (
                 ),
             }),
         ).pipe(
-          Effect.tap(() =>
-            input.requireConfirmedShutdown === true
-              ? sessionOpen.withLock(
-                  input.providerSessionId,
-                  Effect.sync(() => {
-                    unconfirmedShutdowns.delete(input.providerSessionId);
-                  }),
-                )
-              : Effect.void,
-          ),
           Effect.catchCause((cause) =>
             Effect.fail(
               new ProviderSessionReleaseError({
@@ -2169,13 +2114,6 @@ export const layerWithOptions = (
               sessionOpen.withLock(
                 input.providerSessionId,
                 Effect.gen(function* () {
-                  if (unconfirmedShutdowns.has(input.providerSessionId)) {
-                    return yield* new ProviderSessionOpenError({
-                      instanceId: input.modelSelection.instanceId,
-                      providerSessionId: input.providerSessionId,
-                      cause: "Previous provider session shutdown is not confirmed",
-                    });
-                  }
                   const cwd = input.runtimePolicy.cwd;
                   if (cwd !== null) {
                     const workspaceIsDirectory = yield* fileSystem.stat(cwd).pipe(
@@ -2244,9 +2182,6 @@ export const layerWithOptions = (
                       providerSessionId: input.providerSessionId,
                       modelSelection: input.modelSelection,
                       runtimePolicy: input.runtimePolicy,
-                      ...(input.maintenanceRequestId === undefined
-                        ? {}
-                        : { maintenanceRequestId: input.maintenanceRequestId }),
                       ...(input.resumeFromSession === undefined
                         ? {}
                         : { resumeFromSession: input.resumeFromSession }),

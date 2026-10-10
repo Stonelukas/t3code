@@ -54,17 +54,22 @@ installs Pi's example `subagent` extension, T3 Code also shows its task progress
 UI. Pi runs those children without a session, so they cannot be opened or resumed as T3 Code
 threads.
 
-## Restart the Pi RPC Process
+## Restart the Agent Session
 
-In web and desktop, open Thread Details or the command palette and choose **Restart Pi RPC
-process**. Confirm only after the thread has finished its work and has no pending questions,
-background tasks, delegated work, or queued messages. The server checks these conditions again.
+In web and desktop, open the command palette and choose **Restart agent session**. It detaches
+the current Pi runtime; your next message starts a new RPC process and normally resumes the saved
+native conversation. Use it after active work, pending questions, queued messages, and delegated or
+background work have finished. The action does not enforce those settled conditions.
 
-Restart keeps the same T3 thread, saved native Pi conversation, effective model, and thinking level.
-It sends no prompt and does not continue or replay a turn. In-memory extension state, including
-Notebook runtime bindings, may be lost. Thread Details reports the outcome; acceptance alone does
-not mean the restart completed. An unknown outcome blocks new work and must be investigated before
-another attempt. This action is not currently exposed in the mobile client.
+The T3 thread, transcript, checkpoints, and thread model selection remain. Process-local extension
+state, Notebook bindings, and MCP connections reset with the new process. The next prompt applies
+T3's model and thinking selection; changes made only inside Pi are not guaranteed to persist. If
+native resume fails, T3 may start a new native session with transferred context.
+
+The restart notification acknowledges the request, not completed process shutdown. Queued work can
+start the replacement, and pending live questions are not guaranteed to survive. A new normal Pi
+process rereads its configured launcher/profile and MCP files; a browser refresh does not reload
+the running Pi process.
 
 ## Troubleshooting
 

@@ -324,8 +324,6 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
     readonly spawnBeforeOpen?: boolean;
     /** Completed when a hanging scope close reaches its wedged finalizer. */
     readonly scopeCloseReached?: Deferred.Deferred<void>;
-    readonly scopeCloseResult?: Effect.Effect<void>;
-    readonly confirmShutdown?: Effect.Effect<void, ProviderAdapter.ProviderAdapterV2Error>;
   } = {},
 ) {
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
@@ -342,7 +340,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
     (options.scopeCloseReached === undefined
       ? Effect.void
       : Deferred.succeed(options.scopeCloseReached, undefined)
-    ).pipe(Effect.andThen(options.scopeCloseResult ?? Effect.never)),
+    ).pipe(Effect.andThen(Effect.never)),
   );
   return ProviderAdapter.ProviderAdapterV2.of({
     instanceId: ProviderInstanceId.make("codex"),
@@ -392,9 +390,6 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
           driver: CODEX_DRIVER,
           providerSessionId: input.providerSessionId,
           providerSession: session,
-          ...(options.confirmShutdown === undefined
-            ? {}
-            : { confirmShutdown: options.confirmShutdown }),
           events: options.failEventStream
             ? Stream.fail(
                 new ProviderAdapter.ProviderAdapterEventStreamError({
@@ -474,8 +469,6 @@ function layerTest(input: {
   readonly beforeUnload?: Effect.Effect<void>;
   readonly spawnBeforeOpen?: boolean;
   readonly scopeCloseReached?: Deferred.Deferred<void>;
-  readonly scopeCloseResult?: Effect.Effect<void>;
-  readonly confirmShutdown?: Effect.Effect<void, ProviderAdapter.ProviderAdapterV2Error>;
   readonly serverSettingsLayer?: ReturnType<typeof ServerSettings.layerTest>;
   readonly projectServiceLayer?: Layer.Layer<ProjectService.ProjectService>;
 }) {
@@ -508,8 +501,6 @@ function layerTest(input: {
       ...(input.scopeCloseReached === undefined
         ? {}
         : { scopeCloseReached: input.scopeCloseReached }),
-      ...(input.scopeCloseResult === undefined ? {} : { scopeCloseResult: input.scopeCloseResult }),
-      ...(input.confirmShutdown === undefined ? {} : { confirmShutdown: input.confirmShutdown }),
     }).pipe(Effect.map(ProviderAdapterRegistry.layerSingle)),
   );
   const layerConfiguredMcpRegistry =
@@ -2687,157 +2678,6 @@ it.effect("ProviderSessionManagerV2 persists release when session scope close ha
       Effect.provide(layerTest({ state, idleTimeoutMs: 1000, hangSessionScopeClose: true })),
     );
   }),
-);
-
-it.effect.each([
-  "success",
-  "timeout",
-  "failure",
-  "pending work",
-  "active turn",
-  "unobserved exit",
-  "exit failure",
-  "exit timeout",
-] as const)(
-  "ProviderSessionManagerV2 strict shutdown handles %s without an overlapping replacement",
-  (outcome) =>
-    Effect.gen(function* () {
-      const state = yield* Ref.make(emptyState);
-      const scopeCloseReached = yield* Deferred.make<void>();
-      const closeGate = yield* Deferred.make<void>();
-      const confirmingExit = yield* Deferred.make<void>();
-      const pending = yield* Ref.make(outcome === "pending work");
-      const effect = Effect.gen(function* () {
-        const eventSink = yield* EventSink.EventSinkV2;
-        const idAllocator = yield* IdAllocator.IdAllocatorV2;
-        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
-        const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
-        const now = yield* DateTime.now;
-        const threadId = yield* idAllocator.allocate.thread({
-          fixtureName: "provider-session-manager-strict-close",
-          projectId: yield* idAllocator.allocate.project({
-            fixtureName: "provider-session-manager-strict-close",
-          }),
-        });
-        const providerSessionId = yield* idAllocator.allocate.providerSession({
-          providerInstanceId: modelSelection.instanceId,
-          threadId,
-        });
-        yield* eventSink.write({
-          events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
-        });
-        const openInput = { threadId, providerSessionId, modelSelection, runtimePolicy };
-        const runtime = yield* manager.open(openInput);
-        const releaseInput = {
-          providerSessionId,
-          reason: "manual_shutdown" as const,
-          requireConfirmedShutdown: true,
-        };
-        if (outcome === "active turn") {
-          const runId = idAllocator.derive.run({ threadId, ordinal: 1 });
-          yield* runtime.startTurn({
-            appThread: (yield* projectionStore.getThreadProjection(threadId)).thread,
-            threadId,
-            runId,
-            runOrdinal: 1,
-            providerTurnOrdinal: 1,
-            attemptId: idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 }),
-            rootNodeId: idAllocator.derive.rootNode({ runId }),
-            providerThread: makeProviderThread({ idAllocator, threadId, providerSessionId, now }),
-            message: {
-              createdBy: "user",
-              creationSource: "web",
-              messageId: yield* idAllocator.allocate.message({ threadId, ordinal: 1 }),
-              text: "turn",
-              attachments: [],
-            },
-            modelSelection,
-            runtimePolicy,
-          });
-        }
-        if (outcome === "pending work" || outcome === "active turn") {
-          const error = yield* manager.release(releaseInput).pipe(Effect.flip);
-          assert.equal(error._tag, "ProviderSessionReleaseError");
-          assert.equal(yield* manager.open(openInput), runtime);
-          assert.equal((yield* Ref.get(state)).closeCount, 0);
-          yield* Ref.set(pending, false);
-          yield* Deferred.succeed(closeGate, undefined);
-          yield* manager.release({
-            ...releaseInput,
-            requireConfirmedShutdown: outcome !== "active turn",
-          });
-          assert.equal((yield* Ref.get(state)).closeCount, 1);
-          return;
-        }
-        const release = yield* manager.release(releaseInput).pipe(Effect.exit, Effect.forkChild);
-        yield* Deferred.await(scopeCloseReached);
-        assert.equal(
-          (yield* manager.open(openInput).pipe(Effect.flip))._tag,
-          "ProviderSessionOpenError",
-        );
-        assert.equal((yield* Ref.get(state)).openCount, 1);
-        if (outcome === "timeout") {
-          yield* TestClock.adjust("30 seconds");
-        } else {
-          yield* Deferred.succeed(closeGate, undefined);
-        }
-        if (outcome === "exit timeout") {
-          yield* Deferred.await(confirmingExit);
-          yield* TestClock.adjust("30 seconds");
-        }
-        const result = yield* Fiber.join(release);
-        if (outcome === "success") {
-          assert.isTrue(Exit.isSuccess(result));
-          assert.equal((yield* Ref.get(state)).closeCount, 1);
-          const replacement = yield* manager.open(openInput);
-          assert.notEqual(replacement, runtime);
-          assert.equal((yield* Ref.get(state)).openCount, 2);
-        } else {
-          assert.isTrue(Exit.isFailure(result));
-          assert.equal(
-            (yield* manager.open(openInput).pipe(Effect.flip))._tag,
-            "ProviderSessionOpenError",
-          );
-          assert.equal(
-            (yield* manager.release(releaseInput).pipe(Effect.flip))._tag,
-            "ProviderSessionReleaseError",
-          );
-          assert.equal((yield* Ref.get(state)).openCount, 1);
-          yield* Deferred.succeed(closeGate, undefined);
-        }
-      });
-      yield* effect.pipe(
-        Effect.provide(
-          layerTest({
-            state,
-            idleTimeoutMs: 60_000,
-            hangSessionScopeClose: true,
-            scopeCloseReached,
-            scopeCloseResult: Deferred.await(closeGate).pipe(
-              Effect.andThen(outcome === "failure" ? Effect.die("close failed") : Effect.void),
-            ),
-            hasPendingBackgroundWork: Ref.get(pending),
-            ...(outcome === "unobserved exit"
-              ? {}
-              : {
-                  confirmShutdown:
-                    outcome === "exit failure"
-                      ? Effect.fail(
-                          new ProviderAdapter.ProviderAdapterProtocolError({
-                            driver: CODEX_DRIVER,
-                            detail: "exit unknown",
-                          }),
-                        )
-                      : outcome === "exit timeout"
-                        ? Deferred.succeed(confirmingExit, undefined).pipe(
-                            Effect.andThen(Effect.never),
-                          )
-                        : Effect.void,
-                }),
-          }),
-        ),
-      );
-    }),
 );
 
 it.effect("ProviderSessionManagerV2 defers idle release while background work is pending", () =>

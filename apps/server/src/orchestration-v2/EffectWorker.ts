@@ -21,7 +21,6 @@ import * as ResourceCleanupService from "./ResourceCleanupService.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
-import * as ProviderMaintenanceService from "./ProviderMaintenanceService.ts";
 import * as MaintenanceAdmission from "./ProviderMaintenanceAdmission.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
 import * as ProviderTurnStartService from "./ProviderTurnStartService.ts";
@@ -86,7 +85,6 @@ export const layerExecutor: Layer.Layer<
   OrchestrationEffectExecutorV2,
   never,
   | ProviderSessionManager.ProviderSessionManagerV2
-  | ProviderMaintenanceService.ProviderMaintenanceService
   | RunFinalizationService.RunFinalizationService
   | CheckpointRollbackService.CheckpointRollbackServiceV2
   | ProviderTurnControlService.ProviderTurnControlServiceV2
@@ -102,7 +100,6 @@ export const layerExecutor: Layer.Layer<
     const resourceCleanup = yield* ResourceCleanupService.ResourceCleanupService;
     const checkpointRollback = yield* CheckpointRollbackService.CheckpointRollbackServiceV2;
     const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
-    const providerMaintenance = yield* ProviderMaintenanceService.ProviderMaintenanceService;
     const providerTurnControl = yield* ProviderTurnControlService.ProviderTurnControlServiceV2;
     const providerTurnStart = yield* ProviderTurnStartService.ProviderTurnStartServiceV2;
     const runtimeRequests = yield* RuntimeRequestService.RuntimeRequestServiceV2;
@@ -146,19 +143,6 @@ export const layerExecutor: Layer.Layer<
                   ? {}
                   : { revokeMcpCredential: effect.request.revokeMcpCredential }),
               })
-              .pipe(
-                Effect.mapError(
-                  (cause) =>
-                    new OrchestrationEffectExecutionError({
-                      effectId: effect.id,
-                      effectType: effect.request.type,
-                      cause,
-                    }),
-                ),
-              );
-          case "provider-session.restart":
-            return providerMaintenance
-              .execute({ threadId: effect.threadId, requestId: effect.request.requestId })
               .pipe(
                 Effect.mapError(
                   (cause) =>
@@ -521,8 +505,6 @@ export const layerExecutor: Layer.Layer<
     return OrchestrationEffectExecutorV2.of({
       execute: (effect, options) =>
         Effect.gen(function* () {
-          if (effect.request.type === "provider-session.restart")
-            return yield* executor.execute(effect, options);
           if (effect.request.type === "checkpoint.capture") {
             const thread = yield* threads.getThreadShell(effect.threadId);
             const maintenance = thread?.providerMaintenance;
@@ -751,20 +733,12 @@ export const layerWithOptions = (
               return true;
             }
             return false;
-          }).pipe(
-            Effect.onError((cause) =>
-              effect.request.type === "provider-session.restart"
-                ? terminalizeClaim(effect, cause)
-                : requeueClaim(effect, cause),
-            ),
-          );
+          }).pipe(Effect.onError((cause) => requeueClaim(effect, cause)));
           if (cancelledBeforeExecution) return true;
 
           const execution = executor
             .execute(effect, {
-              willRetry:
-                effect.request.type !== "provider-session.restart" &&
-                effect.attemptCount < maxAttempts,
+              willRetry: effect.attemptCount < maxAttempts,
             })
             .pipe(Effect.as("executed" as const));
           const exit = yield* Effect.exit(Effect.raceFirst(execution, cancellation)).pipe(
@@ -803,8 +777,7 @@ export const layerWithOptions = (
             ? yield* outbox
                 .succeed({ effectId: effect.id, workerId })
                 .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
-            : effect.request.type === "provider-session.restart" ||
-                error.includes("Provider maintenance admission refused:") ||
+            : error.includes("Provider maintenance admission refused:") ||
                 effect.attemptCount >= maxAttempts
               ? yield* outbox
                   .fail({ effectId: effect.id, workerId, error })

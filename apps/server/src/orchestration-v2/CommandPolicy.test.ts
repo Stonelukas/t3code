@@ -635,7 +635,7 @@ layer("CommandPolicyV2", (it) => {
 
 it.layer(ProviderMaintenanceAdmission.layer)("ProviderMaintenanceAdmission", (it) => {
   const otherThread = ThreadId.make("maintenance-other-thread");
-  const request = { scope: "thread", threadId, requestId: commandId } as const;
+  const request = { scope: "environment", threadId, requestId: commandId } as const;
 
   it.effect(
     "refuses a reservation while an admitted commit is in flight and releases on completion",
@@ -683,33 +683,8 @@ it.layer(ProviderMaintenanceAdmission.layer)("ProviderMaintenanceAdmission", (it
           .pipe(Effect.flip)).reason,
         "reserved",
       );
-      yield* gate.withOwnerAdmission(
-        reservation,
-        gate.withAdmission({ threadId: otherThread }, Effect.void),
-      );
       yield* gate.release(reservation);
     }),
-  );
-
-  it.effect(
-    "allows nonoverlapping reservations but blocks an environment reservation and unknown-scope work",
-    () =>
-      Effect.gen(function* () {
-        const gate = yield* ProviderMaintenanceAdmission.ProviderMaintenanceAdmission;
-        const first = yield* gate.reserve(request);
-        const second = yield* gate.reserve({ ...request, threadId: otherThread });
-        assert.equal(
-          (yield* gate.reserve({ scope: "environment", requestId: commandId }).pipe(Effect.flip))
-            .reason,
-          "reserved",
-        );
-        assert.equal(
-          (yield* gate.withAdmission({}, Effect.void).pipe(Effect.flip)).reason,
-          "reserved",
-        );
-        yield* gate.release(first);
-        yield* gate.release(second);
-      }),
   );
 
   it.effect("native activity flows through a closed gate and invalidates captured inspection", () =>
@@ -727,33 +702,6 @@ it.layer(ProviderMaintenanceAdmission.layer)("ProviderMaintenanceAdmission", (it
     }),
   );
 
-  it.effect(
-    "thread generations ignore unrelated activity but detect their own and completed admissions",
-    () =>
-      Effect.gen(function* () {
-        const gate = yield* ProviderMaintenanceAdmission.ProviderMaintenanceAdmission;
-        const snapshot = yield* gate.snapshot(request);
-        yield* gate.noteNativeActivity(otherThread);
-        const first = yield* gate.reserve(request);
-        yield* gate.begin(first, snapshot.generation);
-        yield* gate.release(first);
-        const beforeCommit = yield* gate.snapshot(request);
-        yield* gate.withAdmission({ threadId }, Effect.void);
-        const second = yield* gate.reserve(request);
-        assert.equal(
-          (yield* gate.begin(second, beforeCommit.generation).pipe(Effect.flip)).reason,
-          "activity_changed",
-        );
-        const beforeNative = yield* gate.snapshot(request);
-        yield* gate.noteNativeActivity(threadId);
-        assert.equal(
-          (yield* gate.begin(second, beforeNative.generation).pipe(Effect.flip)).reason,
-          "activity_changed",
-        );
-        yield* gate.release(second);
-      }),
-  );
-
   it.effect("release compares the exact reservation, including when a request id is reused", () =>
     Effect.gen(function* () {
       const gate = yield* ProviderMaintenanceAdmission.ProviderMaintenanceAdmission;
@@ -763,10 +711,7 @@ it.layer(ProviderMaintenanceAdmission.layer)("ProviderMaintenanceAdmission", (it
       assert.isFalse(yield* gate.release(first));
       assert.isFalse(yield* gate.release({ ...second, requestId: CommandId.make("wrong-owner") }));
       assert.equal((yield* gate.begin(first).pipe(Effect.flip)).reason, "stale_reservation");
-      assert.equal(
-        (yield* gate.withOwnerAdmission(second, Effect.void).pipe(Effect.flip)).reason,
-        "not_begun",
-      );
+
       assert.equal(
         (yield* gate.withAdmission({ threadId }, Effect.void).pipe(Effect.flip)).reason,
         "reserved",
@@ -847,7 +792,7 @@ it.layer(ProviderMaintenanceAdmission.layer)("ProviderMaintenanceAdmission", (it
   );
 
   it.effect(
-    "only an explicit internal owner interval can exclude its exact ticket and nest behind the gate",
+    "only an explicit reservation interval can exclude its exact ticket without admitting commands",
     () =>
       Effect.gen(function* () {
         const gate = yield* ProviderMaintenanceAdmission.ProviderMaintenanceAdmission;
@@ -867,15 +812,6 @@ it.layer(ProviderMaintenanceAdmission.layer)("ProviderMaintenanceAdmission", (it
                 .withAdmission({ threadId, requestId: commandId }, Effect.void)
                 .pipe(Effect.flip)).reason,
               "reserved",
-            );
-            yield* gate.withOwnerAdmission(
-              reservation,
-              gate.withAdmission(
-                { threadId },
-                Effect.gen(function* () {
-                  assert.equal((yield* gate.snapshot(request)).inFlight, 2);
-                }),
-              ),
             );
             yield* gate.release(reservation);
           }),

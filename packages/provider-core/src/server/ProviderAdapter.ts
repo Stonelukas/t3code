@@ -390,8 +390,6 @@ export interface ProviderAdapterV2OpenSessionInput {
   readonly initialNativeThreadId?: string;
   /** Preserves provider item identity across eager activation of a persisted thread. */
   readonly initialProviderItemIdentityVersion?: 2;
-  /** Host-owned reservation correlation; does not itself authorize maintenance. */
-  readonly maintenanceRequestId?: string;
 }
 
 export interface ProviderAdapterV2EnsureThreadInput {
@@ -563,8 +561,6 @@ export interface ProviderAdapterV2SessionRuntime {
   readonly exitMaintenance?: (input: {
     readonly requestId: string;
   }) => Effect.Effect<void, ProviderAdapterV2Error>;
-  /** Observed exit of the owned child, independent of scope-finalizer success. */
-  readonly confirmShutdown?: Effect.Effect<void, ProviderAdapterV2Error>;
   /**
    * Per-provider-thread pending work for root-run ingestion stop gates. When
    * present, RunExecutionService uses only this probe (never the session-wide

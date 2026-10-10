@@ -32,7 +32,7 @@ import { visibleThreadPullRequests } from "@t3tools/shared/threadPullRequests";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 
-import { getInitialServerConfig, request, requestGuarded } from "../rpc/client.ts";
+import { getInitialServerConfig, request } from "../rpc/client.ts";
 
 interface CommandMetadata {
   readonly commandId?: CommandId;
@@ -210,11 +210,6 @@ export interface RevertThreadCheckpointInput extends ThreadCommandInput {
 }
 
 export type StopThreadSessionInput = ThreadCommandInput;
-
-export type RestartPiRpcInput = Extract<
-  OrchestrationV2Command,
-  { readonly type: "provider-session.restart" }
->;
 
 export interface ForkThreadFromRunInput extends CommandMetadata {
   readonly sourceThreadId: ThreadId;
@@ -938,10 +933,6 @@ export const stopThreadSession = Effect.fn("EnvironmentCommands.stopThreadSessio
   }
   return result;
 });
-
-/** Explicit maintenance only: no detach, prompt, run, or client-side retry. */
-export const restartPiRpc = (input: RestartPiRpcInput) =>
-  requestGuarded(ORCHESTRATION_V2_WS_METHODS.restartPiRpc, input);
 
 export const forkThreadFromRun = Effect.fn("EnvironmentCommands.forkThreadFromRun")(function* (
   input: ForkThreadFromRunInput,

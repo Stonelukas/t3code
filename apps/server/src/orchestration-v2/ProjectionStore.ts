@@ -3041,10 +3041,6 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               ON threads.provider_session_id = sessions.provider_session_id
             WHERE bindings.thread_id = ${threadId}
               AND (sessions.status IN ('starting','running','waiting')
-                OR threads.provider_thread_id = (
-                  SELECT active_provider_thread_id FROM orchestration_v2_projection_threads
-                  WHERE thread_id = ${threadId}
-                )
                 OR threads.provider_thread_id IN (SELECT value FROM json_each(${cohortProviderThreadIds})))
             ORDER BY sessions.updated_at ASC, sessions.provider_session_id ASC
           `,
@@ -3071,10 +3067,6 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               : sql<PayloadRow>`
             SELECT payload_json FROM orchestration_v2_projection_provider_threads
             WHERE (thread_id = ${threadId} AND status = 'active')
-              OR provider_thread_id = (
-                SELECT active_provider_thread_id FROM orchestration_v2_projection_threads
-                WHERE thread_id = ${threadId}
-              )
               OR provider_thread_id IN (SELECT value FROM json_each(${cohortProviderThreadIds}))
               OR owner_node_id IN (SELECT value FROM json_each(${cohortNodeIds}))
             ORDER BY COALESCE(first_run_ordinal, 0), provider_thread_id ASC
@@ -4139,13 +4131,6 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 AND (
                   session.status NOT IN ('stopped', 'error')
                   OR session.provider_session_id IN (
-                    SELECT provider_session_id FROM orchestration_v2_projection_provider_threads
-                    WHERE provider_thread_id = (
-                      SELECT active_provider_thread_id FROM orchestration_v2_projection_threads
-                      WHERE thread_id = ${threadId}
-                    )
-                  )
-                  OR session.provider_session_id IN (
                     SELECT provider_thread.provider_session_id
                     FROM orchestration_v2_projection_provider_threads AS provider_thread
                     WHERE provider_thread.provider_thread_id IN (
@@ -4176,10 +4161,6 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 )
                 AND (
                   provider_thread.status = 'active'
-                  OR provider_thread.provider_thread_id = (
-                    SELECT active_provider_thread_id FROM orchestration_v2_projection_threads
-                    WHERE thread_id = ${threadId}
-                  )
                   OR CASE WHEN json_valid(provider_thread.payload_json)
                     THEN json_array_length(provider_thread.payload_json, '$.pendingBackgroundTasks') > 0
                     ELSE 0 END

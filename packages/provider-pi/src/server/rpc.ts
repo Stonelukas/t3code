@@ -109,8 +109,6 @@ export interface PiRpcConnection {
   readonly events: Queue.Queue<PiRpcRecord, PiRpcError>;
   /** Resolves when the process has exited, with its exit code. */
   readonly exited: Effect.Effect<number, PiRpcError>;
-  /** Owned-child exit observation, usable even after the RPC scope closes. */
-  readonly confirmShutdown: Effect.Effect<void, PiRpcError>;
   /** Counts native records at ingress, before the adapter event permit. */
   readonly nativeActivityVersion: () => number;
   /**
@@ -484,24 +482,6 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
     request,
     events,
     exited: Deferred.await(exitDeferred),
-    confirmShutdown: child.exitCode.pipe(
-      Effect.asVoid,
-      Effect.catch((cause) => {
-        // NodeChildProcessSpawner reports an observed signal exit as a
-        // PlatformError, rather than a numeric code. Only that exact owned
-        // child's exit-event diagnosis is confirmation; arbitrary wait errors
-        // and signal/liveness probes remain unknown.
-        const reason = cause.reason;
-        return reason.module === "ChildProcess" &&
-          reason.method === "exitCode" &&
-          reason.cause instanceof Error &&
-          /^Process interrupted due to receipt of signal: 'SIG[A-Z0-9]+'$/.test(
-            reason.cause.message,
-          )
-          ? Effect.void
-          : Effect.fail(new PiRpcError({ operation: "exit", cause }));
-      }),
-    ),
     nativeActivityVersion: () => nativeActivityVersion,
     terminate: failTransport(
       new PiRpcError({ operation: "terminate", detail: "pi process was stopped" }),

@@ -58,15 +58,11 @@ const layerTest = Layer.mergeAll(
   ),
 );
 
-it.effect.each(["normal", "failed-open", "late-restart"] as const)(
-  "maintains the saved Pi conversation and never replays uncertain maintenance: %s",
-  (scenario) =>
+it.effect(
+  "reserves shared Suite reload without a prompt and quarantines uncertain maintenance",
+  () =>
     Effect.gen(function* () {
       const trace = yield* Ref.make<ReadonlyArray<string>>([]);
-      const failResume = yield* Ref.make(false);
-      const failOpen = yield* Ref.make(false);
-      const delayedResume = yield* Ref.make(false);
-      const resumeEntered = yield* Deferred.make<void>();
       const slowProbe = yield* Ref.make(false);
       const probeEntered = yield* Deferred.make<void>();
       const pauseInspection = yield* Ref.make(false);
@@ -97,10 +93,8 @@ it.effect.each(["normal", "failed-open", "late-restart"] as const)(
             yield* Effect.addFinalizer(() =>
               Ref.update(trace, (current) => [...current, "shutdown"]),
             );
-            if (yield* Ref.get(failOpen))
-              return yield* Effect.die("Synthetic initialization failure after spawn");
             const now = yield* DateTime.now;
-            let requestId = input.maintenanceRequestId;
+            let requestId: string | undefined;
             return {
               instanceId: piInstanceId,
               driver: piAdapter.driver,
@@ -125,7 +119,6 @@ it.effect.each(["normal", "failed-open", "late-restart"] as const)(
                 }
                 return false;
               }),
-              confirmShutdown: Ref.update(trace, (current) => [...current, "confirmed"]),
               enterMaintenance: (owner) =>
                 Effect.sync(() => {
                   requestId = owner.requestId;
@@ -146,20 +139,7 @@ it.effect.each(["normal", "failed-open", "late-restart"] as const)(
                   assert.equal(requestId, owner.requestId);
                   requestId = undefined;
                 }),
-              resumeThread: (resume) =>
-                Effect.gen(function* () {
-                  yield* Ref.update(trace, (current) => [
-                    ...current,
-                    `resume:${resume.providerThread.nativeThreadRef?.nativeId}:${resume.modelSelection?.model}:${resume.modelSelection?.options?.[0]?.value}`,
-                  ]);
-                  if (yield* Ref.get(failResume))
-                    return yield* Effect.die("Synthetic resume failure");
-                  if (yield* Ref.get(delayedResume)) {
-                    yield* Deferred.succeed(resumeEntered, undefined);
-                    yield* Effect.sleep("10 seconds");
-                  }
-                  return resume.providerThread;
-                }),
+              resumeThread: () => Effect.die("No session replacement"),
               ensureThread: () => Effect.die("No new native conversation"),
               startTurn: () => Effect.die("No prompt or continuation"),
               steerTurn: () => Effect.die("No steering"),
@@ -255,144 +235,6 @@ it.effect.each(["normal", "failed-open", "late-restart"] as const)(
             activeProviderThreadId: providerThreadId,
           },
         });
-        const restart = {
-          type: "provider-session.restart" as const,
-          commandId: CommandId.make("restart:maintenance-service"),
-          threadId,
-          providerSessionId: sessionId,
-        };
-        yield* orchestrator.dispatch(restart);
-        yield* maintenance.execute({ threadId, requestId: restart.commandId });
-        yield* maintenance.execute({ threadId, requestId: restart.commandId });
-        assert.deepEqual(yield* Ref.get(trace), [
-          `open:${sessionId}:default`,
-          "shutdown",
-          "confirmed",
-          `open:${sessionId}:${selection.model}`,
-          `resume:/synthetic/saved-pi-session.jsonl:${selection.model}:high`,
-        ]);
-        const restarted = yield* projections.getThreadProjection(threadId);
-        assert.equal(restarted.thread.providerMaintenance?.status, "succeeded");
-        assert.equal(restarted.thread.activeProviderThreadId, providerThreadId);
-        assert.lengthOf(restarted.runs, 0);
-        assert.lengthOf(restarted.messages, 0);
-        // A settled runtime must remain visible without any retained timeline cohort.
-        const bounded = yield* projections.getThreadSnapshotWindow(threadId, {
-          rowLimit: 1,
-          userTurnLimit: 1,
-        });
-        assert.deepEqual(
-          bounded.projection.providerThreads.map((thread) => thread.id),
-          [providerThreadId],
-        );
-        assert.deepEqual(
-          bounded.projection.providerSessions.map((session) => session.id),
-          [sessionId],
-        );
-        assert.deepEqual(
-          restarted.providerThreads.map((thread) => thread.id),
-          [providerThreadId],
-        );
-        assert.deepEqual(
-          restarted.providerSessions.map((session) => session.id),
-          [sessionId],
-        );
-        // Simulate the effect worker's receipt after the directly invoked service completed.
-        const sql = yield* SqlClient.SqlClient;
-        yield* sql`UPDATE orchestration_v2_effect_outbox SET status = 'succeeded' WHERE thread_id = ${threadId}`;
-        if (scenario !== "normal") {
-          const uncertainRestart = { ...restart, commandId: CommandId.make(`restart:${scenario}`) };
-          yield* orchestrator.dispatch(uncertainRestart);
-          if (scenario === "failed-open") {
-            yield* Ref.set(failOpen, true);
-            assert.equal(
-              (yield* Effect.exit(
-                maintenance.execute({ threadId, requestId: uncertainRestart.commandId }),
-              ))._tag,
-              "Failure",
-            );
-          } else {
-            yield* TestClock.adjust("115 seconds");
-            yield* Ref.set(delayedResume, true);
-            const attempt = yield* Effect.exit(
-              maintenance.execute({ threadId, requestId: uncertainRestart.commandId }),
-            ).pipe(Effect.forkChild);
-            yield* Deferred.await(resumeEntered);
-            yield* TestClock.adjust("10 seconds");
-            assert.equal((yield* Fiber.join(attempt))._tag, "Failure");
-          }
-          assert.equal(
-            (yield* projections.getThread(threadId)).providerMaintenance?.status,
-            "unknown",
-          );
-          assert.equal(
-            (yield* Effect.exit(
-              sessions.open({
-                threadId,
-                providerSessionId: sessionId,
-                modelSelection: selection,
-                runtimePolicy,
-              }),
-            ))._tag,
-            "Failure",
-          );
-          assert.equal(
-            (yield* Effect.exit(
-              maintenance.execute({ threadId, requestId: uncertainRestart.commandId }),
-            ))._tag,
-            "Failure",
-          );
-          assert.lengthOf((yield* projections.getThreadProjection(threadId)).runs, 0);
-          assert.lengthOf((yield* projections.getThreadProjection(threadId)).messages, 0);
-          return;
-        }
-        const expiresRestart = {
-          ...restart,
-          commandId: CommandId.make("restart:expire-before-execute"),
-        };
-        yield* orchestrator.dispatch(expiresRestart);
-        yield* TestClock.adjust("121 seconds");
-        assert.equal(
-          (yield* Effect.exit(
-            maintenance.execute({ threadId, requestId: expiresRestart.commandId }),
-          ))._tag,
-          "Failure",
-        );
-        assert.equal(
-          (yield* projections.getThread(threadId)).providerMaintenance?.status,
-          "expired",
-        );
-        assert.lengthOf(yield* Ref.get(trace), 5);
-        yield* sql`UPDATE orchestration_v2_effect_outbox SET status = 'succeeded' WHERE thread_id = ${threadId}`;
-        yield* Ref.set(failResume, true);
-        const failedRestart = { ...restart, commandId: CommandId.make("restart:resume-fails") };
-        yield* orchestrator.dispatch(failedRestart);
-        assert.equal(
-          (yield* Effect.exit(
-            maintenance.execute({ threadId, requestId: failedRestart.commandId }),
-          ))._tag,
-          "Failure",
-        );
-        assert.equal(
-          (yield* projections.getThread(threadId)).providerMaintenance?.status,
-          "failed",
-        );
-        assert.deepEqual((yield* Ref.get(trace)).slice(-2), ["shutdown", "confirmed"]);
-        assert.equal(
-          (yield* Effect.exit(
-            maintenance.execute({ threadId, requestId: failedRestart.commandId }),
-          ))._tag,
-          "Failure",
-        );
-        yield* Ref.set(failResume, false);
-        // A safe failed attempt releases admission; reopen our synthetic runtime for the reload cases.
-        yield* sessions.open({
-          threadId,
-          providerSessionId: sessionId,
-          modelSelection: selection,
-          runtimePolicy,
-        });
-        yield* sql`UPDATE orchestration_v2_effect_outbox SET status = 'succeeded' WHERE thread_id = ${threadId}`;
         const caller = {
           threadId,
           providerSessionId: sessionId,
@@ -417,10 +259,7 @@ it.effect.each(["normal", "failed-open", "late-restart"] as const)(
           threadId: otherThreadId,
           modelSelection,
         });
-        assert.equal(
-          (yield* projections.getThread(threadId)).providerMaintenance?.requestId,
-          failedRestart.commandId,
-        );
+        assert.isUndefined((yield* projections.getThread(threadId)).providerMaintenance);
         const requestId = CommandId.make("reload:maintenance-service");
         const reserved = yield* maintenance.sharedReload({ caller, requestId, phase: "reserve" });
         assert.equal(reserved.reservation.status, "pending");
@@ -584,193 +423,6 @@ it.effect.each(["normal", "failed-open", "late-restart"] as const)(
         assert.lengthOf((yield* projections.getThreadProjection(threadId)).messages, 0);
       }).pipe(Effect.provide(testLayer));
     }),
-);
-
-it.effect("reserves a Pi restart once without a run and blocks new work and message answers", () =>
-  Effect.gen(function* () {
-    const orchestrator = yield* Orchestrator.OrchestratorV2;
-    const projections = yield* ProjectionStore.ProjectionStoreV2;
-    const sql = yield* SqlClient.SqlClient;
-    const threadId = ThreadId.make("thread:pi-restart-controls");
-    const sessionId = ProviderSessionId.make("session:pi-restart-controls");
-    const providerThreadId = ProviderThreadId.make("provider-thread:pi-restart-controls");
-    const now = yield* DateTime.now;
-    yield* orchestrator.dispatch({
-      type: "thread.create",
-      commandId: CommandId.make("create-pi-restart-controls"),
-      threadId,
-      projectId: ProjectId.make("project:pi-restart-controls"),
-      title: "Pi restart",
-      modelSelection: { instanceId: piInstanceId, model: "openai-codex/gpt-6.1-sol" },
-      runtimeMode: "full-access",
-      interactionMode: "default",
-      branch: null,
-      worktreePath: null,
-      createdBy: "user",
-      creationSource: "web",
-    });
-    yield* projections.apply({
-      id: EventId.make("pi-restart-session"),
-      type: "provider-session.attached",
-      threadId,
-      occurredAt: now,
-      payload: {
-        id: sessionId,
-        driver: piAdapter.driver,
-        providerInstanceId: piInstanceId,
-        status: "stopped",
-        cwd: "/repo",
-        model: "openai-codex/gpt-6.1-sol",
-        capabilities: CodexProviderCapabilitiesV2,
-        createdAt: now,
-        updatedAt: now,
-        lastError: null,
-      },
-    });
-    yield* projections.apply({
-      id: EventId.make("pi-restart-provider-thread"),
-      type: "provider-thread.updated",
-      threadId,
-      occurredAt: now,
-      payload: {
-        id: providerThreadId,
-        driver: piAdapter.driver,
-        providerInstanceId: piInstanceId,
-        providerSessionId: sessionId,
-        appThreadId: threadId,
-        ownerNodeId: null,
-        nativeThreadRef: {
-          driver: piAdapter.driver,
-          nativeId: "/repo/saved-pi-session.jsonl",
-          strength: "strong",
-        },
-        nativeConversationHeadRef: null,
-        status: "idle",
-        firstRunOrdinal: 1,
-        lastRunOrdinal: 1,
-        handoffIds: [],
-        forkedFrom: null,
-        createdAt: now,
-        updatedAt: now,
-      },
-    });
-    const thread = yield* projections.getThread(threadId);
-    yield* projections.apply({
-      id: EventId.make("pi-restart-active-thread"),
-      type: "thread.metadata-updated",
-      threadId,
-      occurredAt: now,
-      payload: { ...thread, activeProviderThreadId: providerThreadId },
-    });
-    const bounded = yield* projections.getThreadSnapshotWindow(threadId, {
-      rowLimit: 1,
-      userTurnLimit: 1,
-    });
-    const live = yield* projections.getThreadProjection(threadId);
-    for (const projection of [bounded.projection, live]) {
-      assert.deepEqual(
-        projection.providerThreads.map((thread) => thread.id),
-        [providerThreadId],
-      );
-      assert.deepEqual(
-        projection.providerSessions.map((session) => session.id),
-        [sessionId],
-      );
-      assert.equal(projection.providerSessions[0]?.status, "stopped");
-    }
-    const command = {
-      type: "provider-session.restart" as const,
-      commandId: CommandId.make("restart-pi-controls"),
-      threadId,
-      providerSessionId: sessionId,
-    };
-    yield* orchestrator.dispatch(command);
-    yield* orchestrator.dispatch(command);
-    const reserved = yield* projections.getThreadProjection(threadId);
-    assert.equal(reserved.thread.providerMaintenance?.status, "pending");
-    assert.equal(reserved.thread.providerMaintenance?.requestId, command.commandId);
-    assert.lengthOf(reserved.runs, 0);
-    assert.lengthOf(reserved.messages, 0);
-    const rows = yield* sql<{
-      count: number;
-    }>`SELECT COUNT(*) AS count FROM orchestration_v2_effect_outbox WHERE thread_id = ${threadId}`;
-    assert.equal(rows[0]?.count, 1);
-    assert.equal(
-      (yield* Effect.exit(
-        orchestrator.dispatch({
-          type: "message.dispatch",
-          commandId: CommandId.make("pi-reserved-send"),
-          threadId,
-          messageId: MessageId.make("pi-reserved-message"),
-          text: "Do not start",
-          attachments: [],
-          dispatchMode: { type: "start_immediately" },
-          createdBy: "user",
-          creationSource: "web",
-        }),
-      ))._tag,
-      "Failure",
-    );
-    assert.equal(
-      (yield* Effect.exit(
-        orchestrator.dispatch({
-          type: "queue.resume",
-          commandId: CommandId.make("pi-reserved-queue"),
-          threadId,
-        }),
-      ))._tag,
-      "Failure",
-    );
-    assert.equal(
-      (yield* Effect.exit(
-        orchestrator.dispatch({
-          type: "thread.model-selection.set",
-          commandId: CommandId.make("pi-reserved-model"),
-          threadId,
-          modelSelection: { instanceId: piInstanceId, model: "default" },
-        }),
-      ))._tag,
-      "Failure",
-    );
-    // A request arriving after reservation must not sneak a provider wake or new run through.
-    const requestId = RuntimeRequestId.make("pi-reserved-request");
-    yield* projections.apply({
-      id: EventId.make("pi-reserved-request-event"),
-      type: "runtime-request.updated",
-      threadId,
-      occurredAt: now,
-      payload: {
-        id: requestId,
-        nodeId: NodeId.make("pi-reserved-request-node"),
-        providerTurnId: null,
-        nativeRequestRef: null,
-        kind: "user_input",
-        status: "pending",
-        responseCapability: { type: "message" },
-        createdAt: now,
-        resolvedAt: null,
-      },
-    });
-    assert.equal(
-      (yield* Effect.exit(
-        orchestrator.dispatch({
-          type: "runtime-request.respond",
-          commandId: CommandId.make("pi-reserved-answer"),
-          threadId,
-          requestId,
-          answers: { question: "Do not wake" },
-        }),
-      ))._tag,
-      "Failure",
-    );
-    yield* orchestrator.dispatch({
-      type: "thread.visit",
-      commandId: CommandId.make("pi-reserved-visit"),
-      threadId,
-      visitedAt: DateTime.formatIso(now),
-    });
-    assert.lengthOf((yield* projections.getThreadProjection(threadId)).runs, 0);
-  }).pipe(Effect.provide(layerTest)),
 );
 
 it.effect(

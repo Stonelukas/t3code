@@ -9,7 +9,11 @@ export type AdmissionScope =
   | { readonly scope: "thread"; readonly threadId: ThreadId }
   | { readonly scope: "environment"; readonly threadId?: ThreadId };
 
-export type MaintenanceRequest = AdmissionScope & { readonly requestId: CommandId };
+export type MaintenanceRequest = {
+  readonly scope: "environment";
+  readonly threadId?: ThreadId;
+  readonly requestId: CommandId;
+};
 export type Reservation = MaintenanceRequest & { readonly reservationId: number };
 
 export class ProviderMaintenanceAdmissionError extends Schema.TaggedError<ProviderMaintenanceAdmissionError>()(
@@ -21,7 +25,6 @@ export class ProviderMaintenanceAdmissionError extends Schema.TaggedError<Provid
       "stale_ticket",
       "stale_reservation",
       "activity_changed",
-      "not_begun",
     ]),
     threadId: Schema.optional(ThreadId),
     requestId: Schema.optional(CommandId),
@@ -58,11 +61,6 @@ export class ProviderMaintenanceAdmission extends Context.Service<
       request: MaintenanceRequest,
       effect: Effect.Effect<A, E, R>,
     ) => Effect.Effect<A, E | ProviderMaintenanceAdmissionError, R>;
-    /** Only the internal maintenance owner uses this after begin; a request id alone is not authority. */
-    readonly withOwnerAdmission: <A, E, R>(
-      reservation: Reservation,
-      effect: Effect.Effect<A, E, R>,
-    ) => Effect.Effect<A, E | ProviderMaintenanceAdmissionError, R>;
     /** Internal checkpoint drain only, before begin. Does not admit nested commands or runtime mutations. */
     readonly withDrainAdmission: <A, E, R>(
       reservation: Reservation,
@@ -74,7 +72,6 @@ export class ProviderMaintenanceAdmission extends Context.Service<
 type Ticket = {
   readonly scope: AdmissionScope;
   readonly requestId: CommandId | undefined;
-  readonly owner: Reservation | undefined;
   readonly maintenance: boolean;
 };
 
@@ -162,24 +159,12 @@ const make = Effect.gen(function* () {
             : current.reservations.find((held) => matches(held.reservation, owner));
         if (owner !== undefined && heldOwner === undefined)
           return [fail("stale_reservation", input), current];
-        if (heldOwner !== undefined && (drain ? heldOwner.begun : !heldOwner.begun))
-          return [fail(drain ? "reserved" : "not_begun", input), current];
-        // Drain authority is deliberately not inherited by ordinary admission.
-        const effectiveOwner = drain ? undefined : (owner ?? inherited?.owner);
-        if (
-          effectiveOwner !== undefined &&
-          !current.reservations.some(
-            (held) => held.begun && matches(held.reservation, effectiveOwner),
-          )
-        ) {
-          return [fail("stale_reservation", input), current];
-        }
+        if (heldOwner?.begun === true) return [fail("reserved", input), current];
         if (
           current.reservations.some(
             (held) =>
               overlaps(held.reservation, scope) &&
-              !(drain && owner !== undefined && matches(held.reservation, owner)) &&
-              (effectiveOwner === undefined || !matches(held.reservation, effectiveOwner)),
+              !(drain && owner !== undefined && matches(held.reservation, owner)),
           )
         ) {
           return [fail("reserved", input), current];
@@ -189,8 +174,7 @@ const make = Effect.gen(function* () {
           inherited !== undefined &&
           covers(inherited.scope, scope) &&
           (!maintenance || (inherited.maintenance && inherited.requestId === requestId)) &&
-          (owner === undefined ||
-            (inherited.owner !== undefined && matches(inherited.owner, owner)))
+          owner === undefined
         ) {
           // Retain the same ticket for each protected interval, including forks
           // that enter before the outer interval finishes.
@@ -200,7 +184,7 @@ const make = Effect.gen(function* () {
           );
           return [Effect.succeed(inherited), activity({ ...current, tickets }, inherited.scope)];
         }
-        const ticket: Ticket = { scope, requestId, owner: effectiveOwner, maintenance };
+        const ticket: Ticket = { scope, requestId, maintenance };
         return [
           Effect.succeed(ticket),
           activity({ ...current, tickets: new Map(current.tickets).set(ticket, 1) }, scope),
@@ -240,8 +224,6 @@ const make = Effect.gen(function* () {
       ),
     withMaintenanceAdmission: (request, effect) =>
       protect(request, request.requestId, effect, undefined, true),
-    withOwnerAdmission: (reservation, effect) =>
-      protect(reservation, reservation.requestId, effect, reservation, true),
     withDrainAdmission: (reservation, effect) =>
       protect(reservation, reservation.requestId, effect, reservation, false, true),
     reserve: Effect.fnUntraced(function* (input) {

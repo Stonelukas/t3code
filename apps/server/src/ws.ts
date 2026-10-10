@@ -596,7 +596,6 @@ function toAuthAccessStreamEvent(
 }
 
 const isClientSurface = Schema.is(ClientSurface);
-const isOrchestratorDispatchError = Schema.is(Orchestrator.OrchestratorDispatchError);
 const isClientConnectionMethod = Schema.is(ClientConnectionMethod);
 const isClientDeviceType = Schema.is(ClientDeviceType);
 const isClientOs = Schema.is(ClientOs);
@@ -1816,20 +1815,6 @@ const layerWsRpc = (
       });
 
       const handlers = ServerWsRpcGroup.of({
-        [ORCHESTRATION_V2_WS_METHODS.restartPiRpc]: (command) =>
-          startup.enqueueCommand(threadManagement.dispatch(command)).pipe(
-            Effect.map((result) => ({ sequence: result.sequence })),
-            Effect.mapError(
-              (cause) =>
-                new OrchestrationV2DispatchCommandError({
-                  commandId: command.commandId,
-                  commandType: command.type,
-                  ...(isOrchestratorDispatchError(cause) ? { notAccepted: cause.notAccepted } : {}),
-                  message: userFacingDispatchErrorMessage(cause) ?? "Pi RPC restart was refused.",
-                  cause,
-                }),
-            ),
-          ),
         [ORCHESTRATION_V2_WS_METHODS.dispatchCommand]: (command) =>
           Effect.annotateCurrentSpan({
             "orchestration_v2.command_id": command.commandId,

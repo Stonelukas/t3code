@@ -10,7 +10,6 @@ import {
   PlanId,
   ProjectId,
   ProviderInstanceId,
-  ProviderSessionId,
   RunId,
   RuntimeRequestId,
   ThreadId,
@@ -24,7 +23,6 @@ import {
 import { describe, expect, it } from "@effect/vitest";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
-import { RpcPermissionGuard } from "../rpc/client.ts";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as SubscriptionRef from "effect/SubscriptionRef";
@@ -50,7 +48,6 @@ import {
   promoteQueuedRun,
   reorderActiveThread,
   reorderQueuedRun,
-  restartPiRpc,
   revertThreadCheckpoint,
   settleThread,
   startThreadTurn,
@@ -81,27 +78,13 @@ const makeSupervisor = Effect.fn("TestEnvironmentCommands.makeSupervisor")(funct
   readonly projection?: OrchestrationV2ThreadProjection;
   readonly projectionRequests?: ThreadId[];
   readonly advertiseServerResolvedCommandContext?: boolean;
-  readonly dispatchFailure?: Error;
 }) {
   const client = {
-    [ORCHESTRATION_V2_WS_METHODS.restartPiRpc]: (command: OrchestrationV2Command) =>
-      Effect.sync(() => {
-        input.commands.push(command);
-        return { sequence: input.commands.length };
-      }).pipe(
-        Effect.flatMap((receipt) =>
-          input.dispatchFailure ? Effect.fail(input.dispatchFailure) : Effect.succeed(receipt),
-        ),
-      ),
     [ORCHESTRATION_V2_WS_METHODS.dispatchCommand]: (command: OrchestrationV2Command) =>
       Effect.sync(() => {
         input.commands.push(command);
         return { sequence: input.commands.length };
-      }).pipe(
-        Effect.flatMap((receipt) =>
-          input.dispatchFailure ? Effect.fail(input.dispatchFailure) : Effect.succeed(receipt),
-        ),
-      ),
+      }),
     [ORCHESTRATION_V2_WS_METHODS.getThreadProjection]: (requestInput: {
       readonly threadId: ThreadId;
     }) =>
@@ -165,63 +148,6 @@ const makeSupervisor = Effect.fn("TestEnvironmentCommands.makeSupervisor")(funct
 });
 
 describe("V2 environment commands", () => {
-  it.effect(
-    "restarts the exact saved Pi session without projection reads, prompts, or launches",
-    () =>
-      Effect.gen(function* () {
-        const commands: OrchestrationV2Command[] = [];
-        const launches: OrchestrationV2ThreadLaunchInput[] = [];
-        const projectionRequests: ThreadId[] = [];
-        const supervisor = yield* makeSupervisor({
-          commands,
-          launches,
-          projectionRequests,
-          projects: [],
-        });
-        const input = {
-          type: "provider-session.restart" as const,
-          commandId: CommandId.make("explicit-restart"),
-          threadId: v2ThreadId,
-          providerSessionId: ProviderSessionId.make("saved-pi-session"),
-        };
-        expect(
-          yield* restartPiRpc(input).pipe(
-            Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
-            Effect.provideService(RpcPermissionGuard, { authorize: () => Effect.void }),
-          ),
-        ).toEqual({ sequence: 1 });
-        expect(commands).toEqual([input]);
-        expect(projectionRequests).toEqual([]);
-        expect(launches).toEqual([]);
-      }),
-  );
-
-  it.effect("reports a rejected restart without retrying or substituting a stop", () =>
-    Effect.gen(function* () {
-      const commands: OrchestrationV2Command[] = [];
-      const rejection = new Error("Pi runtime is busy");
-      const supervisor = yield* makeSupervisor({
-        commands,
-        projects: [],
-        dispatchFailure: rejection,
-      });
-      const input = {
-        type: "provider-session.restart" as const,
-        commandId: CommandId.make("refused-restart"),
-        threadId: v2ThreadId,
-        providerSessionId: ProviderSessionId.make("saved-pi-session"),
-      };
-      expect(
-        yield* restartPiRpc(input).pipe(
-          Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
-          Effect.provideService(RpcPermissionGuard, { authorize: () => Effect.void }),
-          Effect.flip,
-        ),
-      ).toBe(rejection);
-      expect(commands).toEqual([input]);
-    }),
-  );
-
   it.effect("routes projects through the event-sourced project transport", () =>
     Effect.gen(function* () {
       const projects: ProjectMutation[] = [];

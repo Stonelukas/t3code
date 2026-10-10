@@ -21,7 +21,6 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import { EventSinkV2 } from "./EventSink.ts";
 import { ProjectionStoreV2 } from "./ProjectionStore.ts";
 import { ProviderSessionManagerV2 } from "./ProviderSessionManager.ts";
-import { RuntimePolicyV2 } from "./RuntimePolicy.ts";
 import { ThreadCommandExecutor } from "./ThreadCommandExecutor.ts";
 import * as MaintenanceAdmission from "./ProviderMaintenanceAdmission.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -67,7 +66,7 @@ export const restoreProviderMaintenanceAdmission = Effect.gen(function* () {
   }
 });
 
-/** Unknown shutdown stays reserved too: a subsequent turn must not reopen it implicitly. */
+/** Unknown reload stays reserved too: a subsequent turn must not reopen it implicitly. */
 export function providerMaintenanceBlocksWork(
   thread: Pick<OrchestrationV2AppThread, "providerMaintenance">,
 ) {
@@ -105,7 +104,7 @@ export function providerMaintenanceRefusal(
     options.validateTarget !== false &&
     (projection.thread.archivedAt !== null || projection.thread.deletedAt !== null)
   )
-    return "Reopen this thread before restarting its Pi RPC session.";
+    return "Reopen this thread before requesting a shared Suite reload.";
   if (
     projection.runs.some((run) => active(run.status) && run !== requestingRun) ||
     projection.nodes.some((node) => active(node.status) && !exemptNodeIds.has(node.id)) ||
@@ -113,7 +112,7 @@ export function providerMaintenanceRefusal(
   )
     return "Provider maintenance requires no other active or queued work.";
   if (projection.runtimeRequests.some((request) => request.status === "pending"))
-    return "Answer or dismiss the pending requests before restarting Pi RPC.";
+    return "Answer or dismiss the pending requests before requesting a shared Suite reload.";
   if (
     projection.providerThreads.some(
       (thread) =>
@@ -134,15 +133,11 @@ export function providerMaintenanceRefusal(
     ) ||
     (projection.thread.pullRequests ?? []).some((link) => link.watch !== undefined)
   )
-    return "Wait for or stop outstanding background and delegated work before restarting Pi RPC.";
+    return "Wait for or stop outstanding background and delegated work before requesting a shared Suite reload.";
   return undefined;
 }
 
 export interface ProviderMaintenanceServiceShape {
-  readonly execute: (input: {
-    readonly threadId: ThreadId;
-    readonly requestId: CommandId;
-  }) => Effect.Effect<void, ProviderMaintenanceError>;
   readonly sharedReload: (input: {
     readonly caller: {
       readonly threadId: ThreadId;
@@ -156,10 +151,6 @@ export interface ProviderMaintenanceServiceShape {
     readonly outcome?: "succeeded" | "failed";
   }) => Effect.Effect<OrchestratorMcpProviderMaintenanceResult, ProviderMaintenanceError>;
   readonly restoreAdmission: Effect.Effect<void, ProviderMaintenanceError>;
-  readonly armDeadline: (input: {
-    readonly threadId: ThreadId;
-    readonly requestId: CommandId;
-  }) => Effect.Effect<void, ProviderMaintenanceError>;
 }
 
 export class ProviderMaintenanceService extends Context.Service<
@@ -172,7 +163,6 @@ export const layer = Layer.effect(
   Effect.gen(function* () {
     const projections = yield* ProjectionStoreV2;
     const sessions = yield* ProviderSessionManagerV2;
-    const policy = yield* RuntimePolicyV2;
     const commands = yield* ThreadCommandExecutor;
     const events = yield* EventSinkV2;
     const ids = yield* IdAllocator.IdAllocatorV2;
@@ -197,12 +187,10 @@ export const layer = Layer.effect(
           if (thread.providerMaintenance?.requestId !== input.requestId)
             return yield* new ProviderMaintenanceError({
               threadId: input.threadId,
-              reason: "The Pi RPC restart reservation changed.",
+              reason: "The Suite reload reservation changed.",
             });
           const now = yield* DateTime.now;
-          const commandId = CommandId.make(
-            `command:pi-session-restart:${status}:${input.requestId}`,
-          );
+          const commandId = CommandId.make(`command:suite-reload:${status}:${input.requestId}`);
           yield* events.write({
             commandId,
             events: [
@@ -348,29 +336,6 @@ export const layer = Layer.effect(
       });
 
     return ProviderMaintenanceService.of({
-      armDeadline: (input) =>
-        Effect.gen(function* () {
-          const thread = yield* projections.getThread(input.threadId);
-          const reservation = thread.providerMaintenance;
-          if (reservation?.requestId !== input.requestId) return;
-          const scope: MaintenanceAdmission.AdmissionScope = {
-            scope: reservation.scope,
-            threadId: input.threadId,
-          };
-          const gate = (yield* admission.snapshot(scope)).reservations.find(
-            (candidate) => candidate.requestId === input.requestId,
-          );
-          if (gate !== undefined) yield* lease(input, gate, reservation.deadlineEpochMs);
-        }).pipe(
-          Effect.mapError(
-            (cause) =>
-              new ProviderMaintenanceError({
-                threadId: input.threadId,
-                reason: "Could not arm the maintenance deadline.",
-                cause,
-              }),
-          ),
-        ),
       restoreAdmission: restoreProviderMaintenanceAdmission.pipe(
         Effect.provideService(ProjectionStoreV2, projections),
         Effect.provideService(MaintenanceAdmission.ProviderMaintenanceAdmission, admission),
@@ -734,289 +699,6 @@ export const layer = Layer.effect(
                   threadId: input.caller.threadId,
                   reason:
                     "Provider maintenance could not complete its requested transition. Do not retry an unknown begin.",
-                  cause,
-                }),
-          ),
-        ),
-      execute: (input) =>
-        Effect.uninterruptibleMask((restore) =>
-          Effect.gen(function* () {
-            const projection = yield* projections.getThreadRecords(input.threadId, [
-              "runs",
-              "nodes",
-              "runtimeRequests",
-              "providerSessions",
-              "providerThreads",
-              "providerTurns",
-              "subagents",
-              "turnItems",
-            ]);
-            const reservation = projection.thread.providerMaintenance;
-            if (reservation?.requestId !== input.requestId || reservation.kind !== "pi-rpc-restart")
-              return yield* new ProviderMaintenanceError({
-                threadId: input.threadId,
-                reason: "This Pi RPC restart was superseded. It will not be replayed.",
-              });
-            if (reservation.status === "succeeded") return;
-            if (
-              reservation.status === "pending" &&
-              DateTime.toEpochMillis(yield* DateTime.now) >= reservation.deadlineEpochMs
-            ) {
-              yield* record(
-                input,
-                "expired",
-                "Pi RPC restart expired before it began. No process was restarted. Request a new restart explicitly.",
-              );
-              const snapshot = yield* admission.snapshot({
-                scope: "thread",
-                threadId: input.threadId,
-              });
-              const expiredGate = snapshot.reservations.find(
-                (held) => held.requestId === input.requestId,
-              );
-              if (expiredGate !== undefined) yield* admission.release(expiredGate);
-              return yield* new ProviderMaintenanceError({
-                threadId: input.threadId,
-                reason: "This Pi RPC restart expired before execution.",
-              });
-            }
-            if (reservation.status !== "pending") {
-              if (reservation.status === "running")
-                yield* record(
-                  input,
-                  "unknown",
-                  "The previous Pi RPC restart attempt did not confirm its outcome. It will not be replayed.",
-                );
-              return yield* new ProviderMaintenanceError({
-                threadId: input.threadId,
-                reason: "This Pi RPC restart has already been attempted. It will not be replayed.",
-              });
-            }
-            let shutdownStarted = false;
-            let oldShutdownConfirmed = false;
-            let replacementOpened = false;
-            let replacementOpenAttempted = false;
-            let barrierAttempted = false;
-            let oldRuntime: ProviderAdapter.ProviderAdapterV2SessionRuntime | undefined;
-            const inspection = yield* admission.snapshot({
-              scope: "thread",
-              threadId: input.threadId,
-            });
-            const gate = inspection.reservations.find((held) => held.requestId === input.requestId);
-            if (gate === undefined) {
-              yield* record(
-                input,
-                "unknown",
-                "The process-local maintenance owner is unavailable. The operation was not replayed.",
-              );
-              return yield* new ProviderMaintenanceError({
-                threadId: input.threadId,
-                reason: "The maintenance reservation has no execution owner.",
-              });
-            }
-            const attempt = yield* Effect.exit(
-              restore(
-                Effect.gen(function* () {
-                  const refusal = providerMaintenanceRefusal(projection);
-                  if (refusal !== undefined)
-                    return yield* new ProviderMaintenanceError({
-                      threadId: input.threadId,
-                      reason: refusal,
-                    });
-                  const providerThread = projection.providerThreads.find(
-                    (thread) => thread.id === reservation.providerThreadId,
-                  );
-                  const previousSession = projection.providerSessions.find(
-                    (session) => session.id === reservation.providerSessionId,
-                  );
-                  if (
-                    providerThread?.driver !== "pi" ||
-                    previousSession?.driver !== "pi" ||
-                    providerThread.nativeThreadRef?.nativeId === undefined
-                  )
-                    return yield* new ProviderMaintenanceError({
-                      threadId: input.threadId,
-                      reason:
-                        "The saved Pi conversation is unavailable. No replacement conversation was created.",
-                    });
-                  const existing = yield* sessions.get(reservation.providerSessionId);
-                  if (
-                    Option.isNone(existing) ||
-                    existing.value.enterMaintenance === undefined ||
-                    existing.value.recheckMaintenance === undefined ||
-                    existing.value.exitMaintenance === undefined
-                  )
-                    return yield* new ProviderMaintenanceError({
-                      threadId: input.threadId,
-                      reason: "The saved Pi runtime is not available for a verified restart.",
-                    });
-                  oldRuntime = existing.value;
-                  if (
-                    existing.value.providerSession.status !== "ready" ||
-                    (yield* existing.value.hasPendingBackgroundWork ?? Effect.succeed(false))
-                  )
-                    return yield* new ProviderMaintenanceError({
-                      threadId: input.threadId,
-                      reason:
-                        "Pi is still active or has a pending native wake. Restart was refused.",
-                    });
-                  barrierAttempted = true;
-                  const selection = yield* existing.value.enterMaintenance({
-                    requestId: input.requestId,
-                  });
-                  const runtimePolicy = yield* policy.resolve({
-                    thread: projection.thread,
-                    modelSelection: selection,
-                  });
-                  yield* existing.value.recheckMaintenance({ requestId: input.requestId });
-                  if (DateTime.toEpochMillis(yield* DateTime.now) >= reservation.deadlineEpochMs)
-                    return yield* new ProviderMaintenanceError({
-                      threadId: input.threadId,
-                      reason: "Pi restart expired during native checks. No shutdown was admitted.",
-                    });
-                  yield* admission.begin(gate, inspection.generation);
-                  yield* record(input, "running", null);
-                  yield* admission.withOwnerAdmission(
-                    gate,
-                    Effect.gen(function* () {
-                      shutdownStarted = true;
-                      yield* sessions.release({
-                        providerSessionId: reservation.providerSessionId,
-                        reason: "manual_shutdown",
-                        requireConfirmedShutdown: true,
-                      });
-                      oldShutdownConfirmed = true;
-                      replacementOpenAttempted = true;
-                      const replacement = yield* sessions.open({
-                        threadId: input.threadId,
-                        providerSessionId: reservation.providerSessionId,
-                        modelSelection: selection,
-                        runtimePolicy,
-                        resumeFromSession: previousSession,
-                        maintenanceRequestId: input.requestId,
-                      });
-                      replacementOpened = true;
-                      const resumed = yield* replacement.resumeThread({
-                        threadId: input.threadId,
-                        providerThread,
-                        modelSelection: selection,
-                        runtimePolicy,
-                      });
-                      if (
-                        resumed.id !== providerThread.id ||
-                        resumed.nativeThreadRef?.nativeId !==
-                          providerThread.nativeThreadRef?.nativeId ||
-                        replacement.recheckMaintenance === undefined ||
-                        replacement.exitMaintenance === undefined ||
-                        (yield* replacement.hasPendingBackgroundWork ?? Effect.succeed(false))
-                      )
-                        return yield* new ProviderMaintenanceError({
-                          threadId: input.threadId,
-                          reason:
-                            "Pi could not verify the original saved conversation. No prompt was sent.",
-                        });
-                      const restored = yield* replacement.recheckMaintenance({
-                        requestId: input.requestId,
-                      });
-                      if (
-                        restored.model !== selection.model ||
-                        restored.options?.find((option) => option.id === "thinking")?.value !==
-                          selection.options?.find((option) => option.id === "thinking")?.value
-                      )
-                        return yield* new ProviderMaintenanceError({
-                          threadId: input.threadId,
-                          reason:
-                            "Pi could not verify the original effective model and thinking level.",
-                        });
-                      yield* replacement.exitMaintenance({ requestId: input.requestId });
-                    }),
-                  );
-                }).pipe(
-                  Effect.timeout(
-                    Math.min(
-                      110_000,
-                      Math.max(
-                        0,
-                        reservation.deadlineEpochMs - DateTime.toEpochMillis(yield* DateTime.now),
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-            );
-            if (Exit.isSuccess(attempt)) {
-              if (DateTime.toEpochMillis(yield* DateTime.now) >= reservation.deadlineEpochMs) {
-                yield* record(
-                  input,
-                  "unknown",
-                  "Pi restart crossed its acknowledgment deadline. It was not replayed; new work remains blocked until containment is verified.",
-                );
-                return yield* new ProviderMaintenanceError({
-                  threadId: input.threadId,
-                  reason: "Pi restart did not acknowledge within its deadline.",
-                });
-              }
-              yield* record(
-                input,
-                "succeeded",
-                "Pi RPC restarted in the same saved conversation. No prompt was sent. Notebook runtime bindings may have been lost.",
-              );
-              yield* admission.release(gate);
-              return;
-            }
-            // A failed resume leaves no half-configured replacement for the next message to use.
-            const cleanup = replacementOpened
-              ? yield* Effect.exit(
-                  restore(
-                    admission
-                      .withOwnerAdmission(
-                        gate,
-                        sessions.release({
-                          providerSessionId: reservation.providerSessionId,
-                          reason: "manual_shutdown",
-                          requireConfirmedShutdown: true,
-                        }),
-                      )
-                      .pipe(Effect.timeout("65 seconds")),
-                  ),
-                )
-              : !shutdownStarted && barrierAttempted && oldRuntime?.exitMaintenance !== undefined
-                ? yield* Effect.exit(
-                    restore(
-                      oldRuntime
-                        .exitMaintenance({ requestId: input.requestId })
-                        .pipe(Effect.timeout("5 seconds")),
-                    ),
-                  )
-                : Exit.void;
-            const uncertain =
-              (shutdownStarted && !oldShutdownConfirmed) ||
-              cleanup._tag === "Failure" ||
-              // Failed open may have spawned a process before failing to return its runtime.
-              // Generic open cleanup does not promise owned-process exit confirmation.
-              (replacementOpenAttempted && !replacementOpened) ||
-              (shutdownStarted &&
-                DateTime.toEpochMillis(yield* DateTime.now) >= reservation.deadlineEpochMs);
-            const message = uncertain
-              ? "Pi RPC shutdown could not be confirmed. Restart was not retried and new work is blocked. Check the provider and server logs before an explicit retry."
-              : "Pi RPC restart failed. No prompt or replacement conversation was sent, and it was not retried. Check the provider and server logs before trying again.";
-            yield* record(input, uncertain ? "unknown" : "failed", message);
-            if (!uncertain) yield* admission.release(gate);
-            return yield* new ProviderMaintenanceError({
-              threadId: input.threadId,
-              reason: message,
-              cause: attempt.cause,
-            });
-          }),
-        ).pipe(
-          (effect) => operationLock.withLock(input.requestId, effect),
-          Effect.mapError((cause) =>
-            isProviderMaintenanceError(cause)
-              ? cause
-              : new ProviderMaintenanceError({
-                  threadId: input.threadId,
-                  reason:
-                    "Could not record the Pi RPC restart outcome. The operation will not be retried.",
                   cause,
                 }),
           ),
