@@ -12,6 +12,8 @@ import {
   cliReleaseIndexPageUrl,
   cliReleaseChannelOf,
   newestCliReleaseVersion,
+  isOwnerManagedForkVersion,
+  OWNER_MANAGED_FORK_UPDATE_REASON,
   type CliReleaseChannel,
 } from "@t3tools/shared/cliRelease";
 import * as Console from "effect/Console";
@@ -347,6 +349,9 @@ const runUpdate = Effect.fn("cli.update.run")(function* (input: {
   const service = yield* BootService.BootService;
 
   const currentVersion = packageJson.version;
+  if (isOwnerManagedForkVersion(currentVersion)) {
+    return yield* new CliUpdateError({ reason: OWNER_MANAGED_FORK_UPDATE_REASON });
+  }
   const channel = input.channel ?? cliReleaseChannelOf(currentVersion);
   if (input.requestedVersion !== undefined && !isExactServiceVersion(input.requestedVersion)) {
     return yield* new CliUpdateError({
@@ -410,6 +415,9 @@ const runUpdate = Effect.fn("cli.update.run")(function* (input: {
   // being stale is an update to do, and the newest of the two is what the
   // downgrade check protects.
   const serviceVersion = serviceInstalled ? status.installedVersion : undefined;
+  if (serviceVersion !== undefined && isOwnerManagedForkVersion(serviceVersion)) {
+    return yield* new CliUpdateError({ reason: OWNER_MANAGED_FORK_UPDATE_REASON });
+  }
   const executableCurrent = targetVersion === currentVersion;
   // A service whose recorded version is missing or unreadable is not known
   // to be current, so it gets the update rather than being skipped. Nor is

@@ -31,6 +31,25 @@ it("orders exact semantic versions without treating build metadata as precedence
   assert.equal(compareExactServiceVersions("2.0.0-alpha-beta", "2.0.0-alpha-alpha"), 1);
   assert.equal(compareExactServiceVersions("2.0.0", "2.0.0-rc.1"), 1);
   assert.equal(compareExactServiceVersions("2.0.0+one", "2.0.0+two"), 0);
+  const upstream = "0.0.46-nightly.20261009.2886";
+  const fork = `${upstream}.stonelukas.1`;
+  assert.isTrue(isExactServiceVersion(fork));
+  assert.equal(compareExactServiceVersions(fork, upstream), 1);
+  assert.equal(compareExactServiceVersions(`${upstream}.stonelukas.2`, fork), 1);
+  assert.equal(compareExactServiceVersions(`${upstream}+stonelukas.1`, upstream), 0);
+  assert.isDefined(
+    decodeServiceState({
+      protocol: SERVICE_LAUNCHER_PROTOCOL,
+      activeVersion: upstream,
+      update: {
+        id: "fork-install",
+        fromVersion: upstream,
+        targetVersion: fork,
+        dbPath: "/isolated/statev2.sqlite",
+        status: "pending",
+      },
+    }),
+  );
 });
 
 it("rejects contradictory service state", () => {
@@ -98,6 +117,50 @@ const writeFakeRuntime = (
   });
 
 it.layer(NodeServices.layer)("service state persistence", (it) => {
+  it.effect("rejects upstream replacement of a fork without changing state or database", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-fork-retention-" });
+      const fork = "0.0.46-nightly.20261009.2886.stonelukas.1";
+      const target = "0.0.46-nightly.20261010.3000";
+      const statePath = path.join(root, "runtime", "service-state.json");
+      const databasePath = path.join(root, "userdata", "statev2.sqlite");
+      const reasonPath = path.join(root, "rejection.txt");
+      yield* fs.makeDirectory(path.dirname(databasePath), { recursive: true });
+      yield* fs.writeFileString(databasePath, "unchanged");
+      yield* writeFakeRuntime(
+        fs,
+        path,
+        path.join(root, "runtime", "versions", fork),
+        `
+const fs = require("node:fs");
+process.on("message", (message) => {
+  if (message.type === "update-rejected") {
+    fs.writeFileSync(${JSON.stringify(reasonPath)}, message.reason);
+    process.exit(0);
+  }
+});
+process.send({ type: "request-update", targetVersion: ${JSON.stringify(target)}, dbPath: ${JSON.stringify(databasePath)} });
+`,
+      );
+      yield* writeFakeRuntime(
+        fs,
+        path,
+        path.join(root, "runtime", "versions", target),
+        `throw new Error("upstream target must not run");`,
+      );
+      const initial = { protocol: SERVICE_LAUNCHER_PROTOCOL, activeVersion: fork } as const;
+      yield* Effect.promise(() => writeServiceState(statePath, initial));
+      const launcher = new Launcher(root, yield* Effect.promise(() => readServiceState(statePath)));
+      yield* Effect.promise(() => launcher.run().catch(() => undefined));
+      assert.include(yield* fs.readFileString(reasonPath), "owner-managed");
+      assert.deepEqual(yield* Effect.promise(() => readServiceState(statePath)), initial);
+      assert.equal(yield* fs.readFileString(databasePath), "unchanged");
+      assert.isFalse(yield* fs.exists(path.join(root, "runtime", "db-backup")));
+    }),
+  );
+
   it.effect("durably replaces and strictly reads one state document", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
