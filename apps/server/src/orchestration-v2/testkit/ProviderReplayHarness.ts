@@ -41,7 +41,6 @@ import * as ProviderContinuationService from "../ProviderContinuationService.ts"
 import * as ProviderEventIngestor from "../ProviderEventIngestor.ts";
 import * as ProviderRuntimeRecoveryService from "../ProviderRuntimeRecoveryService.ts";
 import * as ProviderSessionManager from "../ProviderSessionManager.ts";
-import * as ProviderMaintenanceService from "../ProviderMaintenanceService.ts";
 import * as ProviderSwitchService from "../ProviderSwitchService.ts";
 import * as ProviderTurnControlService from "../ProviderTurnControlService.ts";
 import * as ProviderTurnStartService from "../ProviderTurnStartService.ts";
@@ -278,7 +277,6 @@ export function layerWithRegistry<Error>(
   | Orchestrator.OrchestratorV2
   | EffectWorker.OrchestrationEffectWorkerV2
   | EventSink.EventSinkV2
-  | ProviderMaintenanceService.ProviderMaintenanceService
   | ProviderSessionManager.ProviderSessionManagerV2,
   Error | MigrationError | PlatformError.PlatformError | SqlError
 > {
@@ -364,17 +362,6 @@ export function layerWithRegistry<Error>(
         McpSessionRegistryTestkit.layer,
         layerProviderEventIngestorProvided,
         layerStores,
-      ),
-    ),
-  );
-  const layerProviderMaintenanceProvided = ProviderMaintenanceService.layer.pipe(
-    Layer.provide(
-      Layer.mergeAll(
-        layerStores,
-        layerEventSinkProvided,
-        IdAllocator.layer,
-        layerProviderSessionManagerProvided,
-        ThreadCommandExecutor.layer,
       ),
     ),
   );
@@ -509,7 +496,6 @@ export function layerWithRegistry<Error>(
   const layerReplayRuntime = Layer.mergeAll(
     layerOrchestratorProvided,
     layerProviderSessionManagerProvided,
-    layerProviderMaintenanceProvided,
     layerEffectWorkerProvided,
     layerEventSinkProvided,
     layerContinuationWorkerProvided,

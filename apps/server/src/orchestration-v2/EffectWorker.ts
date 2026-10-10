@@ -21,7 +21,6 @@ import * as ResourceCleanupService from "./ResourceCleanupService.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
-import * as MaintenanceAdmission from "./ProviderMaintenanceAdmission.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
 import * as ProviderTurnStartService from "./ProviderTurnStartService.ts";
 import * as RuntimeRequestService from "./RuntimeRequestService.ts";
@@ -38,8 +37,6 @@ export class OrchestrationEffectExecutionError extends Schema.TaggedError<Orches
     cause: Schema.optional(Schema.Defect()),
   },
 ) {}
-
-const isOrchestrationEffectExecutionError = Schema.is(OrchestrationEffectExecutionError);
 
 /**
  * Pure interrupt races with hard process teardown or a dead session produce
@@ -107,8 +104,7 @@ export const layerExecutor: Layer.Layer<
       yield* ThreadTitleRegenerationService.ThreadTitleRegenerationService;
     const threads = yield* ThreadManagementService.ThreadManagementService;
     const settings = yield* ServerSettings.ServerSettingsService;
-    const admission = yield* MaintenanceAdmission.ProviderMaintenanceAdmission;
-    const executor = OrchestrationEffectExecutorV2.of({
+    return OrchestrationEffectExecutorV2.of({
       execute: (effect, options) => {
         const willRetry = options?.willRetry ?? false;
         switch (effect.request.type) {
@@ -502,51 +498,8 @@ export const layerExecutor: Layer.Layer<
         }
       },
     });
-    return OrchestrationEffectExecutorV2.of({
-      execute: (effect, options) =>
-        Effect.gen(function* () {
-          if (effect.request.type === "checkpoint.capture") {
-            const thread = yield* threads.getThreadShell(effect.threadId);
-            const maintenance = thread?.providerMaintenance;
-            if (
-              maintenance?.kind === "suite-reload" &&
-              maintenance.status === "pending" &&
-              maintenance.scope === "environment" &&
-              maintenance.requestingRunId === effect.request.runId &&
-              DateTime.toEpochMillis(yield* DateTime.now) < maintenance.deadlineEpochMs
-            ) {
-              const snapshot = yield* admission.snapshot({ scope: "environment" });
-              const reservation = snapshot.reservations.find(
-                (candidate) =>
-                  candidate.scope === "environment" &&
-                  candidate.threadId === effect.threadId &&
-                  candidate.requestId === maintenance.requestId,
-              );
-              if (reservation !== undefined)
-                return yield* admission.withDrainAdmission(
-                  reservation,
-                  executor.execute(effect, options),
-                );
-            }
-          }
-          return yield* admission.withAdmission(
-            { threadId: effect.threadId },
-            executor.execute(effect, options),
-          );
-        }).pipe(
-          Effect.mapError((cause) =>
-            isOrchestrationEffectExecutionError(cause)
-              ? cause
-              : new OrchestrationEffectExecutionError({
-                  effectId: effect.id,
-                  effectType: effect.request.type,
-                  cause,
-                }),
-          ),
-        ),
-    });
   }),
-).pipe(Layer.provide(MaintenanceAdmission.layer));
+);
 
 export class OrchestrationEffectWorkerError extends Schema.TaggedError<OrchestrationEffectWorkerError>()(
   "OrchestrationEffectWorkerError",
@@ -737,9 +690,7 @@ export const layerWithOptions = (
           if (cancelledBeforeExecution) return true;
 
           const execution = executor
-            .execute(effect, {
-              willRetry: effect.attemptCount < maxAttempts,
-            })
+            .execute(effect, { willRetry: effect.attemptCount < maxAttempts })
             .pipe(Effect.as("executed" as const));
           const exit = yield* Effect.exit(Effect.raceFirst(execution, cancellation)).pipe(
             Effect.ensuring(outbox.clearCancellation(effect.id)),
@@ -777,8 +728,7 @@ export const layerWithOptions = (
             ? yield* outbox
                 .succeed({ effectId: effect.id, workerId })
                 .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
-            : error.includes("Provider maintenance admission refused:") ||
-                effect.attemptCount >= maxAttempts
+            : effect.attemptCount >= maxAttempts
               ? yield* outbox
                   .fail({ effectId: effect.id, workerId, error })
                   .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))

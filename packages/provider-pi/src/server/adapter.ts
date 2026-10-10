@@ -496,20 +496,6 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         ProviderAdapter.ProviderAdapterProtocolError
       > | null = null;
       let closed = false;
-      let processedNativeActivityVersion = 0;
-      let turnSetups = 0;
-      const trackTurnSetup = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-        Effect.acquireUseRelease(
-          Effect.sync(() => {
-            turnSetups += 1;
-          }),
-          () => effect,
-          () =>
-            Effect.sync(() => {
-              turnSetups -= 1;
-            }),
-        );
-      let maintenance: { requestId: string; activityVersion: number } | null = null;
       yield* Effect.addFinalizer(() =>
         Effect.gen(function* () {
           closed = true;
@@ -1257,7 +1243,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         if (nativeRequestId === undefined) return;
         const approvalTitle = recordString(event, "title") ?? "";
         const approvalKey = `${approvalTitle.length}:${approvalTitle}${recordString(event, "message") ?? ""}`;
-        if (maintenance === null && method === "confirm" && sessionApprovals.has(approvalKey)) {
+        if (method === "confirm" && sessionApprovals.has(approvalKey)) {
           yield* connection.send({
             type: "extension_ui_response",
             id: nativeRequestId,
@@ -1659,13 +1645,6 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         const turn = state?.activeTurn ?? null;
         switch (event["type"]) {
           case "agent_start": {
-            if (maintenance !== null && turn === null && state !== null) {
-              // Record the wake, but never schedule or answer native work on
-              // behalf of maintenance. The barrier remains invalidated.
-              pendingWake = { state, events: [event] };
-              yield* updateProviderSession("running", null);
-              return;
-            }
             if (
               turn === null &&
               state?.providerThread.appThreadId != null &&
@@ -2104,16 +2083,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
       yield* Effect.gen(function* () {
         while (true) {
           const event = yield* Queue.take(connection.events);
-          yield* sessionEventPermit.withPermits(1)(
-            handleSessionEvent(event).pipe(
-              Effect.andThen(
-                Effect.sync(() => {
-                  if (event["type"] !== "response" && !String(event["type"]).startsWith("t3."))
-                    processedNativeActivityVersion += 1;
-                }),
-              ),
-            ),
-          );
+          yield* sessionEventPermit.withPermits(1)(handleSessionEvent(event));
         }
       }).pipe(
         Effect.catchCause((cause) =>
@@ -2391,52 +2361,6 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         return { message, images };
       });
 
-      const checkMaintenance = (requestId: string) =>
-        Effect.gen(function* () {
-          const barrier = maintenance;
-          if (barrier === null || barrier.requestId !== requestId || requestId.length === 0)
-            return yield* protocolError("Pi maintenance reservation does not match");
-          const state = yield* request({ type: "get_state" }).pipe(
-            Effect.mapError((cause) => protocolError("Pi maintenance state probe failed", cause)),
-          );
-          if (
-            closed ||
-            stopRequested ||
-            rollbackBarrier !== null ||
-            threadState === null ||
-            threadState.activeTurn !== null ||
-            turnSetups > 0 ||
-            pendingWake !== null ||
-            pendingPrompts.size > 0 ||
-            pendingPromptResponses.length > 0 ||
-            pendingCompactResponses.length > 0 ||
-            unsolicitedActivityDetected ||
-            connection.nativeActivityVersion() !== barrier.activityVersion ||
-            connection.nativeActivityVersion() !== processedNativeActivityVersion ||
-            recordField(state, "isStreaming") !== false ||
-            recordField(state, "isCompacting") !== false ||
-            recordNumber(state, "pendingMessageCount") !== 0 ||
-            recordString(state, "sessionFile") !==
-              threadState.providerThread.nativeThreadRef?.nativeId
-          )
-            return yield* protocolError(
-              "Pi maintenance refused: native runtime is busy or changed",
-            );
-          const model = recordField(state, "model");
-          const provider = recordString(model, "provider");
-          const modelId = recordString(model, "id");
-          const thinking = recordString(state, "thinkingLevel");
-          if (!provider || !modelId || !thinking || !PI_THINKING_LEVELS.has(thinking))
-            return yield* protocolError(
-              "Pi maintenance requires a concrete native model and thinking level",
-            );
-          return {
-            instanceId: options.instanceId,
-            model: `${provider}/${modelId}`,
-            options: [{ id: "thinking", value: thinking }],
-          } satisfies ModelSelection;
-        });
-
       const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
         instanceId: options.instanceId,
         driver: PI_PROVIDER,
@@ -2445,50 +2369,6 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           return sessionEntity;
         },
         events: Stream.fromQueue(events),
-        enterMaintenance: ({ requestId }) =>
-          sessionEventPermit.withPermits(1)(
-            Effect.gen(function* () {
-              if (
-                requestId.length === 0 ||
-                (maintenance !== null && maintenance.requestId !== requestId)
-              )
-                return yield* protocolError("Pi maintenance reservation does not match");
-              const previous = maintenance;
-              maintenance ??= { requestId, activityVersion: connection.nativeActivityVersion() };
-              return yield* checkMaintenance(requestId).pipe(
-                Effect.onError(() =>
-                  Effect.sync(() => {
-                    if (
-                      previous === null &&
-                      maintenance?.activityVersion === connection.nativeActivityVersion()
-                    )
-                      maintenance = null;
-                  }),
-                ),
-                Effect.onInterrupt(() =>
-                  Effect.sync(() => {
-                    if (
-                      previous === null &&
-                      maintenance?.activityVersion === connection.nativeActivityVersion()
-                    )
-                      maintenance = null;
-                  }),
-                ),
-              );
-            }),
-          ),
-        recheckMaintenance: ({ requestId }) =>
-          sessionEventPermit.withPermits(1)(checkMaintenance(requestId)),
-        exitMaintenance: ({ requestId }) =>
-          sessionEventPermit.withPermits(1)(
-            checkMaintenance(requestId).pipe(
-              Effect.andThen(
-                Effect.sync(() => {
-                  maintenance = null;
-                }),
-              ),
-            ),
-          ),
         hasPendingBackgroundWork: Effect.sync(() => pendingWake !== null),
         hasPendingBackgroundWorkForThread: (providerThread) =>
           Effect.sync(
@@ -2542,8 +2422,6 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           }),
         startTurn: (turnInput) =>
           Effect.gen(function* () {
-            if (maintenance !== null)
-              return yield* protocolError("Cannot start a Pi turn during maintenance");
             if (rollbackBarrier !== null)
               return yield* protocolError("Cannot start a Pi turn during rollback");
             const state = threadState;
@@ -2648,7 +2526,6 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                 closed ||
                 stopRequested ||
                 rollbackBarrier !== null ||
-                maintenance !== null ||
                 state.providerThread.nativeThreadRef?.nativeId !==
                   turnInput.providerThread.nativeThreadRef?.nativeId
               ) {
@@ -2720,7 +2597,6 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             // Rejections therefore return later as id-less response records
             // handled by the event pump.
           }).pipe(
-            trackTurnSetup,
             Effect.mapError(
               (cause) =>
                 new ProviderAdapter.ProviderAdapterTurnStartError({

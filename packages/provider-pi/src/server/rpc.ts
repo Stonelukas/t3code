@@ -109,8 +109,6 @@ export interface PiRpcConnection {
   readonly events: Queue.Queue<PiRpcRecord, PiRpcError>;
   /** Resolves when the process has exited, with its exit code. */
   readonly exited: Effect.Effect<number, PiRpcError>;
-  /** Counts native records at ingress, before the adapter event permit. */
-  readonly nativeActivityVersion: () => number;
   /**
    * Kill the pi process group immediately (SIGTERM, grace, SIGKILL). Used by
    * Stop-with-restart when the process may be wedged and `abort` cannot be
@@ -290,7 +288,6 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
   const transportDown = yield* Deferred.make<never, PiRpcError>();
   const exitDeferred = yield* Deferred.make<number, PiRpcError>();
   let nextRequestId = 0;
-  let nativeActivityVersion = 0;
 
   const failTransport = (error: PiRpcError) =>
     Effect.gen(function* () {
@@ -308,7 +305,6 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
 
   const routeRecord = (record: PiRpcRecord) =>
     Effect.gen(function* () {
-      if (record["type"] !== "response") nativeActivityVersion += 1;
       if (record["type"] === "response" && typeof record["id"] === "string") {
         const pending = pendingRequests.get(record["id"]);
         if (pending !== undefined) {
@@ -482,7 +478,6 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
     request,
     events,
     exited: Deferred.await(exitDeferred),
-    nativeActivityVersion: () => nativeActivityVersion,
     terminate: failTransport(
       new PiRpcError({ operation: "terminate", detail: "pi process was stopped" }),
     ).pipe(Effect.andThen(terminateProcess), Effect.ignore, Effect.uninterruptible),

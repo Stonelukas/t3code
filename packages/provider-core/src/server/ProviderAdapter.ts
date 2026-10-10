@@ -548,20 +548,6 @@ export interface ProviderAdapterV2SessionRuntime {
    */
   readonly hasPendingBackgroundWork?: Effect.Effect<boolean>;
   /**
-   * Local runtime barrier, not an app idle proof or a native execution lock.
-   * Enter captures concrete native selection; recheck/exit refuse intervening
-   * native activity. The host must retain its durable reservation throughout.
-   */
-  readonly enterMaintenance?: (input: {
-    readonly requestId: string;
-  }) => Effect.Effect<ModelSelection, ProviderAdapterV2Error>;
-  readonly recheckMaintenance?: (input: {
-    readonly requestId: string;
-  }) => Effect.Effect<ModelSelection, ProviderAdapterV2Error>;
-  readonly exitMaintenance?: (input: {
-    readonly requestId: string;
-  }) => Effect.Effect<void, ProviderAdapterV2Error>;
-  /**
    * Per-provider-thread pending work for root-run ingestion stop gates. When
    * present, RunExecutionService uses only this probe (never the session-wide
    * hasPendingBackgroundWork) so sibling native threads cannot pin an

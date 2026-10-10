@@ -214,7 +214,6 @@ export interface EffectOutboxV2Shape {
   readonly listByCommandId: (
     commandId: CommandId,
   ) => Effect.Effect<ReadonlyArray<OrchestrationEffectV2>, EffectOutboxError>;
-  readonly hasUnsettled: (threadId: ThreadId) => Effect.Effect<boolean, EffectOutboxError>;
   readonly cancelUnsettled: (input: {
     readonly threadId: ThreadId;
     readonly effectTypes: ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
@@ -441,15 +440,6 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
               ? cause
               : new EffectOutboxError({ operation: "list", cause }),
           ),
-        ),
-      hasUnsettled: (threadId) =>
-        sql<{ readonly effect_id: string }>`
-          SELECT effect_id FROM orchestration_v2_effect_outbox
-          WHERE thread_id = ${threadId} AND status IN ('pending', 'running')
-          LIMIT 1
-        `.pipe(
-          Effect.map((rows) => rows.length > 0),
-          Effect.mapError((cause) => new EffectOutboxError({ operation: "has-unsettled", cause })),
         ),
       cancelUnsettled: ({ threadId, effectTypes, reason }) =>
         Effect.gen(function* () {

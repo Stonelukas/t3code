@@ -21,7 +21,6 @@ import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
-import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as PlatformError from "effect/PlatformError";
@@ -1384,116 +1383,6 @@ describe("PiAdapterV2", () => {
       );
       yield* startTurn(runtime, replacement, "default");
       yield* fake.takeRequest("prompt");
-    }).pipe(Effect.scoped, Effect.provide(layerTest)),
-  );
-
-  it.effect(
-    "binds maintenance to its request and captures inherited native selection without prompting",
-    () =>
-      Effect.gen(function* () {
-        const fake = yield* makeFakePi;
-        const { runtime } = yield* openRuntime(fake);
-        const providerThread = yield* runtime.ensureThread({
-          threadId: THREAD_ID,
-          modelSelection: modelSelection("default"),
-          runtimePolicy,
-        });
-        fake.queueState({
-          model: { provider: "anthropic", id: "native-model" },
-          thinkingLevel: "medium",
-        });
-        const selection = yield* runtime.enterMaintenance!({ requestId: "maintenance-1" });
-        assert.deepEqual(selection, {
-          instanceId: PI_INSTANCE_ID,
-          model: "anthropic/native-model",
-          options: [{ id: "thinking", value: "medium" }],
-        });
-        yield* startTurn(runtime, providerThread, "default").pipe(Effect.flip);
-        yield* runtime.exitMaintenance!({ requestId: "other" }).pipe(Effect.flip);
-        fake.queueState({
-          model: { provider: "anthropic", id: "native-model" },
-          thinkingLevel: "medium",
-        });
-        yield* runtime.exitMaintenance!({ requestId: "maintenance-1" });
-        assert.isFalse(fake.allRequests().some((request) => request.type === "prompt"));
-        yield* startTurn(runtime, providerThread, "default");
-        yield* fake.takeRequest("prompt");
-      }).pipe(Effect.scoped, Effect.provide(layerTest)),
-  );
-
-  it.effect.each([
-    { isStreaming: true },
-    { isCompacting: true },
-    { pendingMessageCount: 1 },
-    { model: undefined },
-  ])("refuses maintenance when native state is busy or selection is unknown: %j", (state) =>
-    Effect.gen(function* () {
-      const fake = yield* makeFakePi;
-      const { runtime } = yield* openRuntime(fake);
-      yield* runtime.ensureThread({
-        threadId: THREAD_ID,
-        modelSelection: modelSelection("default"),
-        runtimePolicy,
-      });
-      fake.queueState({ model: { provider: "anthropic", id: "native-model" }, ...state });
-      yield* runtime.enterMaintenance!({ requestId: "maintenance-1" }).pipe(Effect.flip);
-      assert.isFalse(fake.allRequests().some((request) => request.type === "prompt"));
-    }).pipe(Effect.scoped, Effect.provide(layerTest)),
-  );
-
-  it.effect(
-    "detects native activity racing maintenance setup before the event permit is available",
-    () =>
-      Effect.gen(function* () {
-        const fake = yield* makeFakePi;
-        const { runtime } = yield* openRuntime(fake);
-        yield* runtime.ensureThread({
-          threadId: THREAD_ID,
-          modelSelection: modelSelection("default"),
-          runtimePolicy,
-        });
-        fake.deferNextState();
-        const requests = fake.allRequests().filter((r) => r.type === "get_state").length;
-        const entering = yield* runtime.enterMaintenance!({ requestId: "maintenance-1" }).pipe(
-          Effect.exit,
-          Effect.forkChild,
-        );
-        // Drain prior state requests, then rendezvous on the held probe.
-        for (let i = 0; i <= requests; i++) yield* fake.takeRequest("get_state");
-        yield* fake.emit({ type: "agent_start" });
-        yield* fake.resolveDeferredState({
-          ...recordedIdleState(FAKE_SESSION_FILE),
-          model: { provider: "anthropic", id: "native-model" },
-        });
-        assert.isTrue(Exit.isFailure(yield* Fiber.join(entering)));
-      }).pipe(Effect.scoped, Effect.provide(layerTest)),
-  );
-
-  it.effect("keeps a maintenance barrier invalidated by native wake activity", () =>
-    Effect.gen(function* () {
-      const fake = yield* makeFakePi;
-      const { runtime, takeEvent } = yield* openRuntime(fake);
-      const providerThread = yield* runtime.ensureThread({
-        threadId: THREAD_ID,
-        modelSelection: modelSelection("default"),
-        runtimePolicy,
-      });
-      fake.queueState({ model: { provider: "anthropic", id: "native-model" } });
-      yield* runtime.enterMaintenance!({ requestId: "maintenance-1" });
-      yield* fake.emit({ type: "agent_start" });
-      yield* takeEvent(
-        (event) =>
-          event.type === "provider_session.updated" && event.providerSession.status === "running",
-      );
-      fake.queueState({ model: { provider: "anthropic", id: "native-model" } });
-      yield* runtime.exitMaintenance!({ requestId: "maintenance-1" }).pipe(Effect.flip);
-      yield* startTurn(runtime, providerThread, "default").pipe(Effect.flip);
-      assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
-      assert.isFalse(
-        fake
-          .allRequests()
-          .some((request) => request.type === "prompt" || request.type === "extension_ui_response"),
-      );
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 

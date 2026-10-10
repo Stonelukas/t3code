@@ -361,30 +361,6 @@ export const OrchestrationV2LimitRecoveryUpdate = Schema.Struct({
 );
 export type OrchestrationV2LimitRecoveryUpdate = typeof OrchestrationV2LimitRecoveryUpdate.Type;
 
-/** One durable owner for explicit provider maintenance; never a run or queued prompt. */
-export const OrchestrationV2ProviderMaintenance = Schema.Struct({
-  requestId: CommandId,
-  kind: Schema.Literal("suite-reload"),
-  scope: Schema.Literal("environment"),
-  providerSessionId: ProviderSessionId,
-  providerThreadId: ProviderThreadId,
-  deadlineEpochMs: Schema.Number,
-  callerNamespace: Schema.optional(Schema.String),
-  callerIssuedAt: Schema.optional(Schema.Number),
-  requestingRunId: Schema.optional(Schema.NullOr(RunId)),
-  status: Schema.Literals([
-    "pending",
-    "running",
-    "succeeded",
-    "failed",
-    "unknown",
-    "expired",
-    "cancelled",
-  ]),
-  message: Schema.NullOr(Schema.String),
-});
-export type OrchestrationV2ProviderMaintenance = typeof OrchestrationV2ProviderMaintenance.Type;
-
 export const OrchestrationV2AppThread = Schema.Struct({
   ...OrchestrationV2CreationFields,
   id: ThreadId,
@@ -403,7 +379,6 @@ export const OrchestrationV2AppThread = Schema.Struct({
   /** Pull request discovered from the thread's current branch. */
   branchPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
   activeProviderThreadId: Schema.NullOr(ProviderThreadId),
-  providerMaintenance: Schema.optional(OrchestrationV2ProviderMaintenance),
   historyOrigin: Schema.optional(OrchestrationV2ThreadHistoryOrigin),
   lineage: OrchestrationV2AppThreadLineage,
   forkedFrom: Schema.NullOr(
@@ -1877,7 +1852,6 @@ export const OrchestrationV2ThreadShell = Schema.Struct({
   lineage: OrchestrationV2AppThreadLineage,
   forkedFrom: Schema.NullOr(OrchestrationV2AppThread.fields.forkedFrom),
   activeProviderThreadId: Schema.NullOr(ProviderThreadId),
-  providerMaintenance: Schema.optional(OrchestrationV2ProviderMaintenance),
   historyOrigin: Schema.optional(OrchestrationV2ThreadHistoryOrigin),
   latestRunId: Schema.NullOr(RunId),
   latestRunRequestedAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),

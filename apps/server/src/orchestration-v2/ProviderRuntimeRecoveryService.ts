@@ -23,11 +23,6 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { restartContinuationRun } from "./RestartContinuation.ts";
 import {
-  providerMaintenanceBlocksWork,
-  restoreProviderMaintenanceAdmission,
-} from "./ProviderMaintenanceService.ts";
-import * as MaintenanceAdmission from "./ProviderMaintenanceAdmission.ts";
-import {
   cancelledRosterTaskWork,
   cancelledTurnItemWork,
   mergeRestartCancelledBackgroundWork,
@@ -185,7 +180,6 @@ function latestStartedRun(
 }
 
 export const make = Effect.gen(function* () {
-  const admission = yield* MaintenanceAdmission.ProviderMaintenanceAdmission;
   const settings = yield* ServerSettings.ServerSettingsService;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const eventSink = yield* EventSink.EventSinkV2;
@@ -257,26 +251,6 @@ export const make = Effect.gen(function* () {
           ),
         );
       const events: Array<OrchestrationV2DomainEvent> = [];
-      const maintenance = projection.thread.providerMaintenance;
-      if (maintenance !== undefined && ["pending", "running"].includes(maintenance.status)) {
-        events.push({
-          id: yield* allocateEventId(),
-          type: "thread.metadata-updated",
-          threadId: projection.thread.id,
-          providerInstanceId: projection.thread.providerInstanceId,
-          occurredAt: now,
-          payload: {
-            ...projection.thread,
-            updatedAt: now,
-            providerMaintenance: {
-              ...maintenance,
-              status: "unknown",
-              message:
-                "The server stopped before shared Suite reload was acknowledged. It was not replayed. Check the provider and server logs before an explicit retry.",
-            },
-          },
-        });
-      }
       // Background work that outlived its settled turn. The provider transcript
       // cannot record its death, so the next provider turn is told instead.
       // Shutdown records it too: a graceful restart cancels it there first.
@@ -675,9 +649,7 @@ export const make = Effect.gen(function* () {
         });
       }
       const continuationRun =
-        continueAfterRestart &&
-        trigger === "startup" &&
-        !providerMaintenanceBlocksWork(projection.thread)
+        continueAfterRestart && trigger === "startup"
           ? restartContinuationRun(projection)
           : undefined;
       const effects: Array<EffectOutbox.PendingOrchestrationEffectV2> = continuationRun
@@ -809,7 +781,6 @@ export const make = Effect.gen(function* () {
     for (const threadId of threadIds) {
       yield* Effect.gen(function* () {
         const projection = yield* projections.getRuntimeRecoveryProjection(threadId);
-        if (providerMaintenanceBlocksWork(projection.thread)) return;
         if (
           !resolveProjectSettings(enabled, projection.thread.projectId).settings
             .continueThreadsAfterServerUpdate
@@ -844,20 +815,10 @@ export const make = Effect.gen(function* () {
   );
 
   const recover = Effect.gen(function* () {
-    const summary = yield* reconcile("startup");
-    yield* restoreProviderMaintenanceAdmission.pipe(
-      Effect.provideService(ProjectionStore.ProjectionStoreV2, projections),
-      Effect.provideService(MaintenanceAdmission.ProviderMaintenanceAdmission, admission),
-      Effect.mapError(
-        (cause) => new ProviderRuntimeRecoveryError({ operation: "reconcile", cause }),
-      ),
-    );
-    return summary satisfies ProviderRuntimeRecoverySummary;
+    return (yield* reconcile("startup")) satisfies ProviderRuntimeRecoverySummary;
   });
 
   return ProviderRuntimeRecoveryService.of({ reconcile, prepareForShutdown, recover });
 });
 
-export const layer = Layer.effect(ProviderRuntimeRecoveryService, make).pipe(
-  Layer.provide(MaintenanceAdmission.layer),
-);
+export const layer = Layer.effect(ProviderRuntimeRecoveryService, make);

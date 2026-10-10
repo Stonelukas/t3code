@@ -99,10 +99,6 @@ const ProbeToolkit = Toolkit.make(
     }),
   }),
   Tool.make("writes_environment", probe),
-  Tool.make("provider_maintenance", {
-    ...probe,
-    parameters: Schema.Struct({ phase: Schema.String }),
-  }),
 );
 const ran = Effect.succeed({ ran: "ran" });
 const probeHandlers: McpToolAccess.Handlers<typeof ProbeToolkit.tools> = {
@@ -119,7 +115,6 @@ const probeHandlers: McpToolAccess.Handlers<typeof ProbeToolkit.tools> = {
     (_, modes) => Effect.succeed({ ran: `${modes.runtimeMode}/${modes.interactionMode}` }),
   ),
   writes_environment: McpToolAccess.writesEnvironment(() => ran),
-  provider_maintenance: McpToolAccess.writesProviderMaintenance(() => ran),
 };
 const layerProbeHandlers = McpToolAccess.toLayer(ProbeToolkit, probeHandlers);
 
@@ -268,16 +263,6 @@ it.effect.each([
   ["writes_environment", plan, {}, "capability_denied"],
   ["writes_environment", fullAccessClient, {}, "ran"],
   ["writes_environment", supervisedClient, {}, "capability_denied"],
-  // Reserve needs the live foreground turn. Exact reservation transitions can run after it drains.
-  ["provider_maintenance", fullAccess, { phase: "reserve" }, "ran"],
-  ["provider_maintenance", ended, { phase: "reserve" }, "parent_not_active"],
-  ["provider_maintenance", ended, { phase: "begin" }, "ran"],
-  ["provider_maintenance", ended, { phase: "finish" }, "ran"],
-  ["provider_maintenance", ended, { phase: "cancel" }, "ran"],
-  ["provider_maintenance", ended, { phase: "status" }, "ran"],
-  ["provider_maintenance", supervised, { phase: "begin" }, "capability_denied"],
-  ["provider_maintenance", plan, { phase: "status" }, "capability_denied"],
-  ["provider_maintenance", fullAccessClient, { phase: "begin" }, "thread_credential_required"],
 ] as const)("%s from %o with %o: %s", ([tool, scope, args, expected]) =>
   call(tool, scope, args).pipe(
     Effect.map((outcome) => expect(outcome).toBe(expected)),

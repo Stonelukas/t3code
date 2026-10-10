@@ -29,8 +29,6 @@ import {
   OrchestratorMcpThreadWaitResult,
   ThreadMetadataMcpUpdateInput,
   ThreadMetadataMcpUpdateResult,
-  OrchestratorMcpProviderMaintenanceInput,
-  OrchestratorMcpProviderMaintenanceResult,
 } from "@t3tools/contracts";
 import { Tool, Toolkit } from "effect/ai";
 
@@ -38,7 +36,6 @@ import * as ThreadManagementService from "../../../orchestration-v2/ThreadManage
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as OrchestratorMcpService from "../../OrchestratorMcpService.ts";
 import * as ThreadMetadataMcpService from "../../ThreadMetadataMcpService.ts";
-import * as ProviderMaintenanceService from "../../../orchestration-v2/ProviderMaintenanceService.ts";
 
 const dependencies = [
   McpInvocationContext.McpInvocationContext,
@@ -259,25 +256,7 @@ const ThreadInterruptTool = Tool.make("t3_thread_interrupt", {
   .annotate(Tool.Title, "Interrupt a T3 thread")
   .annotate(Tool.Destructive, true);
 
-export const ProviderMaintenanceTool = Tool.make("t3_provider_maintenance", {
-  description:
-    "Source-supported shared Suite reload admission for a live full-access/default Pi thread. Use one stable clientRequestId. reserve creates a caller/session-bound 120-second reservation and exempts only the requesting foreground run while it drains; it is NOT permission to reload. After that run drains, begin rechecks all T3 work and native runtimes. Only a FIRST begin response with mayExecute=true authorizes one immediate native reload attempt. A repeated or lost begin must not replay the reload. finish requires an acknowledged succeeded/failed outcome before the deadline. cancel releases only a reservation that never began. status reads this exact reservation without acknowledging delegated work. No prompt, continuation, automatic retry, deployment, or native execution freeze is provided by this tool. Expiry after begin is unknown and keeps new work blocked until containment is verified. Caller identity is taken from the credential, not tool arguments. This fences this T3 environment's managed runtimes, not other servers or unmanaged Pi processes.",
-  parameters: OrchestratorMcpProviderMaintenanceInput,
-  success: OrchestratorMcpProviderMaintenanceResult,
-  failure: OrchestratorMcpFailure,
-  failureMode: "return",
-  dependencies: [
-    McpInvocationContext.McpInvocationContext,
-    ThreadManagementService.ThreadManagementService,
-    ProviderMaintenanceService.ProviderMaintenanceService,
-  ],
-})
-  .annotate(Tool.Title, "Reserve provider maintenance")
-  .annotate(Tool.Readonly, false)
-  .annotate(Tool.Destructive, true);
-
 export const OrchestratorToolkit = Toolkit.make(
-  ProviderMaintenanceTool,
   OrchestratorCapabilitiesTool,
   DelegateTaskTool,
   TaskStatusTool,

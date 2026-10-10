@@ -5,42 +5,8 @@ import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import * as OrchestratorMcpService from "../../OrchestratorMcpService.ts";
 import * as ThreadMetadataMcpService from "../../ThreadMetadataMcpService.ts";
-import { CommandId, OrchestratorMcpFailure, ProviderSessionId } from "@t3tools/contracts";
-import * as ProviderMaintenanceService from "../../../orchestration-v2/ProviderMaintenanceService.ts";
 
 const handlers = {
-  t3_provider_maintenance: McpToolAccess.writesProviderMaintenance((input, check) =>
-    Effect.gen(function* () {
-      yield* check;
-      const scope = yield* McpInvocationContext.McpInvocationContext;
-      const caller = yield* McpInvocationContext.requireThreadScope(
-        scope,
-        "t3_provider_maintenance",
-      );
-      const service = yield* ProviderMaintenanceService.ProviderMaintenanceService;
-      return yield* service
-        .sharedReload({
-          caller: {
-            threadId: caller.thread.threadId,
-            providerSessionId: ProviderSessionId.make(caller.thread.providerSessionId),
-            providerInstanceId: caller.thread.providerInstanceId,
-            namespace: caller.requestNamespace,
-            issuedAt: caller.issuedAt,
-          },
-          requestId: CommandId.make(
-            `command:provider-maintenance:${caller.requestNamespace}:${caller.issuedAt}:${input.clientRequestId}`,
-          ),
-          phase: input.phase,
-          ...(input.outcome === undefined ? {} : { outcome: input.outcome }),
-        })
-        .pipe(
-          Effect.mapError(
-            (cause) =>
-              new OrchestratorMcpFailure({ code: "invalid_request", message: cause.message }),
-          ),
-        );
-    }),
-  ),
   orchestrator_capabilities: McpToolAccess.reads(() =>
     Effect.gen(function* () {
       const scope = yield* McpInvocationContext.McpInvocationContext;

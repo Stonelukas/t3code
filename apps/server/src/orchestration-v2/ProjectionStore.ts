@@ -492,12 +492,6 @@ export interface ProjectionStoreV2Shape {
   readonly getRecoveryThreadIds: (
     kind: ProjectionRecoveryKind,
   ) => Effect.Effect<ReadonlyArray<ThreadId>, ProjectionStoreV2Error>;
-  /** Bounded candidate set for rare maintenance checks; includes held queues and runless work. */
-  readonly getMaintenanceThreadIds: Effect.Effect<ReadonlyArray<ThreadId>, ProjectionStoreV2Error>;
-  readonly getBlockingMaintenanceThreadIds: Effect.Effect<
-    ReadonlyArray<ThreadId>,
-    ProjectionStoreV2Error
-  >;
   readonly getUnreadableThreadIds: () => Effect.Effect<
     ReadonlyArray<ThreadId>,
     ProjectionStoreV2Error
@@ -572,7 +566,6 @@ function needsRecovery(
     }
     case "runtime":
       return (
-        ["pending", "running"].includes(projection.thread.providerMaintenance?.status ?? "") ||
         projection.runs.some(
           (run) =>
             ["preparing", "starting", "running", "waiting"].includes(run.status) ||
@@ -1520,9 +1513,6 @@ export function threadShellFromProjection(
     pinOrderKey: projection.thread.pinOrderKey ?? null,
     lastVisitedAt: projection.thread.lastVisitedAt,
     titleRegeneration: projection.thread.titleRegeneration ?? null,
-    ...(projection.thread.providerMaintenance === undefined
-      ? {}
-      : { providerMaintenance: projection.thread.providerMaintenance }),
     limitRecovery: projection.thread.limitRecovery ?? null,
     deletedAt: projection.thread.deletedAt,
   };
@@ -1778,9 +1768,6 @@ function shellFromState(input: {
     pinOrderKey: input.state.thread.pinOrderKey ?? null,
     lastVisitedAt: input.state.thread.lastVisitedAt,
     titleRegeneration: input.state.thread.titleRegeneration ?? null,
-    ...(input.state.thread.providerMaintenance === undefined
-      ? {}
-      : { providerMaintenance: input.state.thread.providerMaintenance }),
     limitRecovery: input.state.thread.limitRecovery ?? null,
     deletedAt: input.state.thread.deletedAt,
   };
@@ -3558,43 +3545,6 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
     );
 
-    const getBlockingMaintenanceThreadIds = Effect.gen(function* () {
-      const rows = yield* sql<{
-        readonly thread_id: string;
-      }>`SELECT thread_id FROM orchestration_v2_projection_threads
-        WHERE CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.providerMaintenance.status') IN ('pending', 'running', 'unknown') ELSE 0 END
-        ORDER BY thread_id LIMIT 129`;
-      return rows.map((row) => ThreadId.make(row.thread_id));
-    }).pipe(Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })));
-    const getMaintenanceThreadIds = Effect.gen(function* () {
-      const rows = yield* sql<{ readonly thread_id: string }>`
-        SELECT thread_id FROM (
-          SELECT thread_id FROM orchestration_v2_projection_threads
-          WHERE NOT json_valid(payload_json)
-            OR json_extract(payload_json, '$.providerMaintenance.status') IN ('pending', 'running', 'unknown')
-            OR EXISTS (SELECT 1 FROM json_each(payload_json, '$.pullRequests') WHERE json_type(value, '$.watch') = 'object')
-          UNION SELECT thread_id FROM orchestration_v2_projection_runs
-          WHERE status IN ('preparing', 'queued', 'starting', 'running', 'waiting')
-            OR json_extract(payload_json, '$.delegatedCompletion.disposition') = 'open'
-          UNION SELECT thread_id FROM orchestration_v2_projection_nodes
-          WHERE status IN ('pending', 'running', 'waiting')
-          UNION SELECT thread_id FROM orchestration_v2_projection_runtime_requests WHERE status = 'pending'
-          UNION SELECT thread_id FROM orchestration_v2_projection_provider_threads
-          WHERE status = 'active' OR json_array_length(payload_json, '$.pendingBackgroundTasks') > 0
-          UNION SELECT thread_id FROM orchestration_v2_projection_provider_turns WHERE status IN ('pending', 'running')
-          UNION SELECT thread_id FROM orchestration_v2_projection_subagents
-          WHERE status IN ('pending', 'running', 'waiting') OR json_extract(payload_json, '$.completionDelivery.state') IN ('pending', 'claimed')
-          UNION SELECT thread_id FROM orchestration_v2_projection_turn_items
-          WHERE type IN ('command_execution', 'dynamic_tool', 'subagent') AND status IN ('pending', 'running', 'waiting')
-          UNION SELECT bindings.thread_id FROM orchestration_v2_projection_provider_session_bindings AS bindings
-          JOIN orchestration_v2_projection_provider_sessions AS sessions USING (provider_session_id)
-          WHERE sessions.status NOT IN ('stopped', 'error')
-          UNION SELECT thread_id FROM orchestration_v2_effect_outbox WHERE status IN ('pending', 'running')
-        ) ORDER BY thread_id LIMIT 129
-      `;
-      return rows.map((row) => ThreadId.make(row.thread_id));
-    }).pipe(Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })));
-
     const getRecoveryThreadIds = Effect.fn("ProjectionStore.getRecoveryThreadIds")(
       function* (kind: ProjectionRecoveryKind) {
         const candidates = (() => {
@@ -3652,11 +3602,6 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                       THEN json_array_length(payload_json, '$.pendingBackgroundTasks') > 0
                       ELSE 0 END
                 )
-                SELECT thread_id FROM orchestration_v2_projection_threads
-                WHERE CASE WHEN json_valid(payload_json)
-                  THEN json_extract(payload_json, '$.providerMaintenance.status') IN ('pending', 'running')
-                  ELSE 0 END
-                UNION
                 SELECT thread_id FROM orchestration_v2_projection_runs
                 WHERE status IN ('preparing', 'starting', 'running', 'waiting')
                 UNION
@@ -5980,8 +5925,6 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getProviderControlContext,
       getLimitRecoveryCandidates,
       getRecoveryThreadIds,
-      getMaintenanceThreadIds,
-      getBlockingMaintenanceThreadIds,
       getUnreadableThreadIds,
       getThreadSnapshot,
       getThreadSnapshotWindow,
@@ -6170,22 +6113,6 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
               .toSorted((left, right) => left.id.localeCompare(right.id)),
           ),
         ),
-      getMaintenanceThreadIds: Ref.get(replayState).pipe(
-        Effect.map((state) => [...state.projections.keys()].sort().slice(0, 129)),
-      ),
-      getBlockingMaintenanceThreadIds: Ref.get(replayState).pipe(
-        Effect.map((state) =>
-          [...state.projections.values()]
-            .filter((projection) =>
-              ["pending", "running", "unknown"].includes(
-                projection.thread.providerMaintenance?.status ?? "",
-              ),
-            )
-            .map((projection) => projection.thread.id)
-            .sort()
-            .slice(0, 129),
-        ),
-      ),
       getRecoveryThreadIds: (kind) =>
         Effect.gen(function* () {
           const projections = (yield* Ref.get(replayState)).projections;
