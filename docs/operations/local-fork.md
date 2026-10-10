@@ -69,12 +69,19 @@ remain topic/PR work followed by a new approved fork artifact. There is no
 retention bypass flag; returning to upstream is a separate explicit installation
 decision. A release mirror setting does not opt a fork into normal updates.
 
-These checks protect the fork server's update paths, not arbitrary external
-installers or an upstream CLI that rewrites service files. Coordinate every such
-operation with the service owner. The targeted release is the standalone server
-and served web client; the desktop manifest is stamped for consistency but no
-fork Electron artifact is approved. A future fork desktop distribution must
-address its separate Electron auto-updater before shipping.
+The matching fork desktop is packaged without an update feed and refuses its
+separate Electron automatic and manual update paths, including install-on-quit.
+It retains nightly branding and settings defaults; changing an update channel
+does not opt it back into upstream replacement. Its embedded web client is
+independent of the browser's server-served client, so replacing the standalone
+server alone does not update an already installed desktop UI. Prepare and review
+both artifacts when both clients are in use.
+
+These checks protect fork-owned update paths, not arbitrary external installers,
+an upstream desktop installation or an upstream CLI that rewrites service files.
+Coordinate every such operation with the service owner. Exact shell CLI, selected
+launcher/service and desktop ownership must be established at cutover; source
+guards do not change the existing upstream installation by themselves.
 
 ## Preparation is not deployment
 
